@@ -1,34 +1,29 @@
 {
   "name": "pi-interactive-subagents",
-  "version": "3.7.2",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in tmux",
-  "keywords": [
-    "pi-package"
-  ],
+  "version": "4.0.0",
+  "description": "Shared-workspace subagents over Pi RPC, with centralized progress and questions",
+  "keywords": ["pi-package"],
   "license": "MIT",
   "author": "Amos Blomqvist",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/amosblomqvist/pi-interactive-subagents"
-  },
   "type": "module",
+  "engines": { "node": ">=22" },
   "scripts": {
-    "test": "node --test test/test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
   },
+  "pi": { "extensions": ["./pi-extension/subagents/index.ts"] },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-coding-agent": ">=0.85.1 <0.86.0",
+    "@earendil-works/pi-ai": ">=0.85.1 <0.86.0",
+    "@earendil-works/pi-tui": ">=0.85.1 <0.86.0"
   },
-  "pi": {
-    "extensions": [
-      "./pi-extension/subagents/index.ts"
-    ]
-  },
+  "dependencies": { "typebox": "1.1.38", "yaml": "2.8.3" },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.65.0",
-    "@mariozechner/pi-tui": "^0.65.0",
-    "@sinclair/typebox": "^0.34.49"
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-tui": "0.85.1",
+    "@types/node": "^22.0.0",
+    "tsx": "4.23.0",
+    "typescript": "5.9.3"
   }
 }
