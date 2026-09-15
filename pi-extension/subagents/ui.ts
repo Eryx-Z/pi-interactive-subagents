@@ -14,7 +14,7 @@ export function widget(manager: TaskManager, ctx: ExtensionContext): void {
   ctx.ui.setWidget("rpc-subagents", sorted.length ? ["Subagents — /subagents to inspect, message, answer, cancel or continue", ...sorted.slice(0, 5).map(r => clean(taskSummary(r)).replace(/\s+/g, " ").slice(0, 150)), ...(sorted.length > 5 ? [`+${sorted.length - 5} saved tasks`] : [])] : undefined);
 }
 export function detail(r: TaskRecord): string {
-  return clean(`${taskSummary(r)}\nRole: ${r.loadout.agent} · Context: ${r.context} · Run: ${r.run}\nOwnership: ${r.ownership}\nCwd: ${r.loadout.cwd}\nSession: ${r.sessionFile}\nTask: ${r.task}\n${r.error ?? ""}\n\nQuestions:\n${r.questions.map(q => `${q.id}: ${q.title}${q.responseSent ? " (answer sent)" : ""}`).join("\n")}\n\nLatest assistant text (bounded):\n${r.output}\n\nRecent activity (bounded):\n${r.log.join("\n")}`);
+  return clean(`${taskSummary(r)}\nContext: ${r.context} · Run: ${r.run}\nOwnership: ${r.ownership}\nCwd: ${r.loadout.cwd}\nSession: ${r.sessionFile}\nTask: ${r.task}\n${r.error ?? ""}\n\nQuestions:\n${r.questions.map(q => `${q.id}: ${q.title}${q.responseSent ? " (answer sent)" : ""}`).join("\n")}\n\nLatest assistant text (bounded):\n${r.output}\n\nRecent activity (bounded):\n${r.log.join("\n")}`);
 }
 export async function taskMenu(manager: TaskManager, ctx: ExtensionContext, taskId?: string): Promise<void> {
   if (!ctx.hasUI) throw new Error("Use subagent_control in headless mode");

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { taskMenu, widget, resultRenderer } from "../pi-extension/subagents/ui.ts";
 
 function setup() {
-  const record: any = { id: "task-id", name: "auth work", state: "running", loadout: { agent: "worker", cwd: "/project" }, context: "partial", run: 1, ownership: "src/auth", sessionFile: "/tmp/session.jsonl", task: "fix auth", startedAt: Date.now(), updatedAt: Date.now(), activity: "read: auth.ts", output: "working", log: [], questions: [] };
+  const record: any = { id: "task-id", name: "auth work", state: "running", loadout: { cwd: "/project" }, context: "partial", run: 1, ownership: "src/auth", sessionFile: "/tmp/session.jsonl", task: "fix auth", startedAt: Date.now(), updatedAt: Date.now(), activity: "read: auth.ts", output: "working", log: [], questions: [] };
   const calls: any[] = [], notices: string[] = [];
   const manager: any = {
     records: new Map([[record.id, record]]),

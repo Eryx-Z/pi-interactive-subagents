@@ -1,12 +1,13 @@
 {
   "name": "pi-interactive-subagents",
   "version": "4.0.0",
-  "description": "Shared-workspace subagents over Pi RPC, with centralized progress and questions",
+  "description": "Context-based shared-workspace subagents over Pi RPC, inheriting parent tools and skills",
   "keywords": ["pi-package"],
   "license": "MIT",
   "author": "Amos Blomqvist",
   "type": "module",
   "engines": { "node": ">=22" },
+  "files": ["pi-extension/", "README.md", "LICENSE"],
   "scripts": {
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
@@ -17,7 +18,7 @@
     "@earendil-works/pi-ai": ">=0.85.1 <0.86.0",
     "@earendil-works/pi-tui": ">=0.85.1 <0.86.0"
   },
-  "dependencies": { "typebox": "1.1.38", "yaml": "2.8.3" },
+  "dependencies": { "typebox": "1.1.38" },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@earendil-works/pi-ai": "0.85.1",

@@ -1,8 +1,8 @@
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { RpcProcess, type RpcEvent, type RpcLaunch } from "./rpc.ts";
-import { CHILD_EXTENSION, validateLoadout, type Loadout } from "./agents.ts";
-import { atomicWrite, addLog, bounded, terminal, uniqueName, TaskStore, type TaskRecord } from "./store.ts";
+import { CHILD_EXTENSION, validateLoadout, type Loadout } from "./loadout.ts";
+import { atomicWrite, addLog, bounded, uniqueName, TaskStore, type TaskRecord } from "./store.ts";
 import { COOPERATION, seedSession, taskPrompt, type ContextMode } from "./context.ts";
 import type { AgentMessage } from "./context.ts";
 
@@ -14,13 +14,14 @@ interface LiveRun {
   rpc: RpcProcess; release: () => void; finishing?: Promise<void>; pendingMessages: number;
   settled: boolean; lastStop?: string; lastError?: string; started: boolean; askToolCallId?: string;
   persistTimer?: ReturnType<typeof setTimeout>; settleChecking?: boolean; checkAgain?: boolean;
+  finalTools: Map<string, boolean>;
 }
 export function childLaunch(record: TaskRecord, dir: string, command: string, baseArgs: string[] = []): RpcLaunch {
   const l = validateLoadout(record.loadout);
   const loadoutPath = join(dir, `${record.id}.loadout.json`);
   const promptPath = join(dir, `${record.id}.prompt.md`);
   atomicWrite(loadoutPath, JSON.stringify(l));
-  atomicWrite(promptPath, `${l.prompt}\n\n${COOPERATION}`);
+  atomicWrite(promptPath, COOPERATION);
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_RPC_SUBAGENT_") || key === "PI_SESSION_FILE" || key === "PI_SESSION_ID") delete env[key];
   env.PI_RPC_SUBAGENT_LOADOUT = loadoutPath;
@@ -31,8 +32,9 @@ export function childLaunch(record: TaskRecord, dir: string, command: string, ba
     args: [...baseArgs, "--mode", "rpc", "--session", record.sessionFile,
       "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
       "--tools", l.tools.join(","), "--model", l.model, "--thinking", l.thinking,
-      l.promptMode === "replace" ? "--system-prompt" : "--append-system-prompt", promptPath,
-      ...l.extensions.flatMap(p => ["-e", p]), "-e", CHILD_EXTENSION],
+      "--append-system-prompt", promptPath,
+      ...l.skills.flatMap(s => ["--skill", s.loadPath ?? s.filePath]),
+      "-e", CHILD_EXTENSION, ...l.extensions.flatMap(p => ["-e", p])],
   };
 }
 function text(message: any): string {
@@ -64,7 +66,7 @@ export class TaskManager {
     validateLoadout(input.loadout);
     const id = randomUUID();
     const record: TaskRecord = {
-      version: 1, id, name: uniqueName(input.name ?? input.loadout.agent, [...this.records.values()].map(r => r.name)),
+      version: 1, id, name: uniqueName(input.name ?? input.context, [...this.records.values()].map(r => r.name)),
       task: input.task, ownership: input.ownership, context: input.context, loadout: structuredClone(input.loadout),
       state: "running", startedAt: Date.now(), updatedAt: Date.now(), sessionFile: join(this.store.dir, `${id}.session.jsonl`),
       output: "", activity: "starting RPC", log: [], questions: [], stopped: false, run: 1,
@@ -95,12 +97,14 @@ export class TaskManager {
   }
   private async start(record: TaskRecord, prompt: string, reserved?: () => void): Promise<void> {
     let release = reserved;
+    let spawned = false;
     try {
       release ??= this.store.lock(record.id);
       const launch = childLaunch(record, this.store.dir, this.options.command, this.options.baseArgs);
       const rpc = (this.options.createRpc ?? (l => new RpcProcess(l)))(launch);
-      const live: LiveRun = { rpc, release, pendingMessages: 1, settled: false, started: false };
+      const live: LiveRun = { rpc, release, pendingMessages: 1, settled: false, started: false, finalTools: new Map() };
       this.live.set(record.id, live);
+      spawned = true;
       rpc.on("event", event => {
         try { this.event(record, live, event); }
         catch (e) { void this.finish(record, "failed", String(e)); }
@@ -120,7 +124,7 @@ export class TaskManager {
       addLog(record, "Initial task accepted by RPC (not a completion acknowledgement)");
       this.save(record); this.maybeComplete(record, live);
     } catch (e) {
-      if (this.live.has(record.id)) await this.finish(record, "failed", String(e));
+      if (spawned) await this.finish(record, "failed", String(e));
       else {
         release?.(); record.state = "failed"; record.error = String(e); record.stopped = true; this.save(record);
       }
@@ -137,6 +141,7 @@ export class TaskManager {
     if (event.type === "message_start" && event.message?.role === "assistant") record.output = "";
     if (event.type === "message_end" && event.message?.role === "assistant") {
       record.output = bounded(text(event.message)); live.lastStop = event.message.stopReason; live.lastError = event.message.errorMessage;
+      live.finalTools = new Map((event.message.content ?? []).filter((b: any) => b.type === "toolCall").map((b: any) => [b.id, false]));
       addLog(record, `Assistant: ${record.output}`);
     }
     if (event.type === "tool_execution_start") {
@@ -146,6 +151,7 @@ export class TaskManager {
     }
     if (event.type === "tool_execution_update") record.activity = `${event.toolName}: ${bounded(text(event.partialResult), 200)}`;
     if (event.type === "tool_execution_end") {
+      if (live.finalTools.has(event.toolCallId)) live.finalTools.set(event.toolCallId, event.result?.terminate === true && event.isError === false);
       if (event.toolName === "ask_question") live.askToolCallId = undefined;
       addLog(record, `${event.isError ? "Failed" : "Done"} ${event.toolName} (${event.toolCallId}): ${text(event.result)}`);
       if (event.toolName === "ask_question") record.questions = record.questions.filter(q => q.toolCallId !== event.toolCallId);
@@ -168,6 +174,7 @@ export class TaskManager {
       // Child widgets/notifications are not terminal components and do not own the parent's UI.
     }
     if (event.type === "agent_settled") { live.settled = true; this.maybeComplete(record, live); }
+    if (event.type === "queue_update" && !live.started) this.maybeComplete(record, live);
     if (!live.finishing) {
       if (event.type === "message_update" || event.type === "tool_execution_update") {
         if (!live.persistTimer) live.persistTimer = setTimeout(() => {
@@ -179,15 +186,20 @@ export class TaskManager {
     }
   }
   private maybeComplete(record: TaskRecord, live: LiveRun): void {
-    if (!live.settled || !live.started || live.pendingMessages || record.questions.length || live.finishing) return;
+    if ((live.started && !live.settled) || live.pendingMessages || record.questions.length || live.finishing) return;
     if (live.settleChecking) { live.checkAgain = true; return; }
     // A supplement can race an older run's agent_settled. Query after all prompt receipts,
     // then recheck local counters before closing a session that may now be running again.
     live.settleChecking = true;
     void live.rpc.request("get_state").then(state => {
-      if (!live.finishing && live.settled && live.pendingMessages === 0 && !record.questions.length &&
+      if (!live.finishing && (!live.started || live.settled) && live.pendingMessages === 0 && !record.questions.length &&
           state?.isStreaming === false && !state.isCompacting && !state.pendingMessageCount) {
-        const final = live.lastStop === "aborted" ? "cancelled" : live.lastStop === "stop" ? "completed" : "failed";
+        if (!live.started) {
+          void this.finish(record, "failed", "RPC accepted the task but no agent run started and no work is queued (input may have been handled by an extension)");
+          return;
+        }
+        const terminated = live.lastStop === "toolUse" && live.finalTools.size > 0 && [...live.finalTools.values()].every(Boolean);
+        const final = live.lastStop === "aborted" ? "cancelled" : live.lastStop === "stop" || terminated ? "completed" : "failed";
         void this.finish(record, final, final === "failed" ? live.lastError ?? `Run settled with stopReason=${live.lastStop ?? "missing"}` : undefined);
       }
     }).catch(e => { if (!live.finishing) void this.finish(record, "failed", String(e)); })
@@ -242,6 +254,7 @@ export class TaskManager {
     const record = this.get(id);
     if (!this.live.has(record.id)) throw new Error("Task is not running");
     await this.finish(record, "cancelled", "Cancelled by parent");
+    if (!record.stopped) throw new Error(`Cancellation could not confirm shutdown; continuation disabled: ${record.error ?? "unknown stop failure"}`);
   }
   async shutdown(): Promise<void> {
     this.closed = true;

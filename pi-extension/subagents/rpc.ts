@@ -30,6 +30,9 @@ export class JsonlDecoder {
 export class RpcProcess extends EventEmitter {
   private child: ChildProcessWithoutNullStreams;
   private pending = new Map<string, { type: string; resolve: (data: any) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  // Caller rejection/timeout does not cancel Pi's asynchronous prompt preflight.
+  private promptPreflights = new Set<string>();
+  private preflightsDrained?: () => void;
   private closed = false;
   private stopping?: Promise<void>;
   private exitPromise: Promise<void>;
@@ -58,6 +61,11 @@ export class RpcProcess extends EventEmitter {
   }
   private receive(event: RpcEvent): void {
     if (event.type === "response") {
+      // Receipts arrive after preflight, not after model completion. Keep recognizing
+      // late receipts even when their caller has timed out or was rejected by stop().
+      if (event.command === "prompt" && typeof event.success === "boolean" && this.promptPreflights.delete(event.id) && !this.promptPreflights.size) {
+        this.preflightsDrained?.();
+      }
       const p = this.pending.get(event.id);
       if (!p) return;
       this.pending.delete(event.id); clearTimeout(p.timer);
@@ -67,26 +75,41 @@ export class RpcProcess extends EventEmitter {
     } else this.emit("event", event);
   }
   send(event: RpcEvent): void {
+    if (this.closed) throw new Error("RPC process is closed");
+    if (this.stopping) throw new Error("RPC process is stopping");
+    this.write(event);
+  }
+  private write(event: RpcEvent): void {
     if (this.closed || this.child.stdin.destroyed) throw new Error("RPC process is closed");
-    this.child.stdin.write(JSON.stringify(event) + "\n");
+    if (event.type === "prompt" && typeof event.id !== "string") event = { ...event, id: randomUUID() };
+    const line = JSON.stringify(event) + "\n";
+    if (event.type === "prompt") {
+      if (this.promptPreflights.has(event.id)) throw new Error("Duplicate unresolved prompt ID");
+      this.promptPreflights.add(event.id);
+    }
+    this.child.stdin.write(line);
   }
   request(type: string, fields: Record<string, unknown> = {}): Promise<any> {
     if (this.closed || this.stopping) return Promise.reject(new Error("RPC process is stopping"));
+    return this.requestWithTimeout(type, fields, this.timeoutMs, true);
+  }
+  private requestWithTimeout(type: string, fields: Record<string, unknown>, timeoutMs: number, stopOnTimeout: boolean): Promise<any> {
     const id = randomUUID();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         const error = new Error(`RPC ${type} timed out; acceptance/execution is unknown`);
-        reject(error); this.fail(error); void this.stop().catch(() => {});
-      }, this.timeoutMs);
+        reject(error);
+        if (stopOnTimeout) { this.fail(error); void this.stop().catch(() => {}); }
+      }, timeoutMs);
       this.pending.set(id, { type, resolve, reject, timer });
-      try { this.send({ ...fields, type, id }); }
+      try { this.write({ ...fields, type, id }); }
       catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e); }
     });
   }
   stop(): Promise<void> {
     if (this.stopping) return this.stopping;
-    this.stopping = this.stopProcess();
+    this.stopping = Promise.resolve().then(() => this.stopProcess());
     return this.stopping;
   }
   private signal(signal: NodeJS.Signals): void {
@@ -96,27 +119,49 @@ export class RpcProcess extends EventEmitter {
       else if (!this.closed) this.child.kill(signal);
     } catch (e: any) { if (e.code !== "ESRCH") throw e; }
   }
+  private async waitForPromptPreflights(): Promise<void> {
+    if (!this.promptPreflights.size) return;
+    if (this.closed) throw new Error("Prompt acceptance is unknown after child exit");
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.preflightsDrained = undefined;
+        reject(new Error("Prompt preflight did not settle; acceptance remains unknown"));
+      }, this.graceMs);
+      this.preflightsDrained = () => {
+        clearTimeout(timer); this.preflightsDrained = undefined; resolve();
+      };
+    });
+  }
   private async stopProcess(): Promise<void> {
     this.rejectPending(new Error("RPC process stopping"));
-    if (this.closed) return;
-    // stdin EOF requests graceful Pi disposal; signals also stop child tool processes.
-    if (!this.child.stdin.destroyed && this.child.stdin.writable) {
+    let cleanupConfirmed = false;
+    let cleanupError: unknown;
+    // Idle/abort does not cover pending input/before_agent_start hooks. Drain their
+    // receipts first, then abort while Pi still has its detached-bash signal cleanup.
+    try {
+      await this.waitForPromptPreflights();
+      await this.requestWithTimeout("clear_queue", {}, this.graceMs, false);
+      await this.requestWithTimeout("abort", {}, this.graceMs, false);
+      cleanupConfirmed = true;
+    } catch (error) { cleanupError = error; /* No EOF or confirmation when preflight/abort is uncertain. */ }
+    if (cleanupConfirmed && !this.child.stdin.destroyed && this.child.stdin.writable) {
       try { this.child.stdin.end(); } catch {}
-    }
+    } else this.signal("SIGTERM");
     const delay = (ms: number) => new Promise<void>(r => {
       if (this.closed) return r();
       const t = setTimeout(r, ms);
       this.exitPromise.then(() => { clearTimeout(t); r(); });
     });
     await delay(this.graceMs);
-    if (this.closed) return;
-    this.signal("SIGTERM");
-    await delay(this.graceMs);
-    if (this.closed) return;
-    this.signal("SIGKILL");
     if (!this.closed) {
+      this.signal("SIGTERM");
       await delay(this.graceMs);
-      if (!this.closed) throw new Error("Could not confirm child process exit; continuation disabled");
     }
+    if (!this.closed) {
+      this.signal("SIGKILL");
+      await delay(this.graceMs);
+    }
+    if (!this.closed) throw new Error("Could not confirm child process exit; continuation disabled");
+    if (!cleanupConfirmed) throw new Error(`Child exited without confirmed agent/tool cleanup; continuation disabled: ${cleanupError}`);
   }
 }

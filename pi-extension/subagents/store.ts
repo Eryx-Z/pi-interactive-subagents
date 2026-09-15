@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync, renameSync, readFileSync, readdirSync, existsSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { validateLoadout, type Loadout } from "./agents.ts";
+import { validateLoadout, type Loadout } from "./loadout.ts";
 import type { ContextMode } from "./context.ts";
 
 export type TaskState = "running" | "waiting" | "completed" | "failed" | "cancelled";

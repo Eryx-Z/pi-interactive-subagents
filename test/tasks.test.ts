@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 import { TaskStore, uniqueName, addLog } from "../pi-extension/subagents/store.ts";
 import { TaskManager, childLaunch } from "../pi-extension/subagents/tasks.ts";
 import { RpcProcess } from "../pi-extension/subagents/rpc.ts";
-import { parseAgent, validateLoadout, resolveLoadout, discoverAgents, type Loadout } from "../pi-extension/subagents/agents.ts";
+import { validateLoadout } from "../pi-extension/subagents/loadout.ts";
+import { loadout as makeLoadout } from "./fixtures/loadout.ts";
 
 const fake = fileURLToPath(new URL('./fixtures/fake-rpc.mjs', import.meta.url));
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -17,7 +18,7 @@ function setup() {
   const events: string[] = [];
   const create = () => new TaskManager(new TaskStore(dir), { command: process.execPath, createRpc: l => new RpcProcess({ ...l, args: [fake] }, 1000, 25), notify: (r, kind) => events.push(`${r.id}:${kind}:${r.state}`) });
   const manager = create();
-  const loadout: Loadout = { version: 1, agent: 'worker', tools: ['read', 'ask_question'], extensions: [], model: 'fake/test', thinking: 'off', prompt: 'role', promptMode: 'append', cwd: dir, agentDir: dir };
+  const loadout = makeLoadout(dir);
   return { dir, manager, loadout, events, create, async clean() { await manager.shutdown(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
@@ -62,7 +63,8 @@ test('provider error and unexpected exit become failed, not successful completio
   try {
     for (const scenario of ['SCENARIO_ERROR', 'SCENARIO_DIE']) {
       const r = await t.manager.launch({ task: scenario, ownership: scenario, context: 'none', loadout: t.loadout });
-      await until(() => r.stopped); assert.equal(r.state, 'failed'); assert.ok(r.error);
+      await until(() => r.state === 'failed' && r.activity === 'failed');
+      assert.equal(r.stopped, scenario !== 'SCENARIO_DIE'); assert.ok(r.error);
     }
   } finally { await t.clean(); }
 });
@@ -94,19 +96,15 @@ test('stale live records and lockfiles never auto-resume orphan writers', async 
     assert.throws(() => t.manager.store.lock(r.id), /locked/); release();
   } finally { await t.clean(); }
 });
-test('loadouts default deny, reject malformed snapshots/nested tools and snapshot absolute extension paths', () => {
+test('inherited loadouts reject legacy snapshots and nested tools; launch uses explicit resources', () => {
   const t = setup();
   try {
-    const file = join(t.dir, 'different-filename.md');
-    const agent = parseAgent('---\nname: named-role\ntools:\nmodel: fake/test\n---\nRole', file);
-    assert.deepEqual(agent.tools, []);
-    const l = resolveLoadout(agent, t.dir, 'fake/test', 'off', t.dir);
-    assert.deepEqual(l.tools, ['ask_question']);
-    assert.throws(() => validateLoadout({}), /Invalid/);
-    assert.throws(() => parseAgent('---\nname: bad\ntools: subagent\n---\n', file), /nested/);
-    const launch = childLaunch({ id: 'example', sessionFile: '/tmp/session.jsonl', loadout: l } as any, t.dir, 'pi');
-    assert.ok(launch.args.includes('--no-extensions')); assert.ok(launch.args.includes('--no-context-files')); assert.equal(launch.cwd, t.dir);
-    assert.equal(launch.args[launch.args.indexOf('--tools') + 1], 'ask_question');
+    assert.throws(() => validateLoadout({ version: 1 }), /legacy profile tasks/);
+    assert.throws(() => validateLoadout({ ...t.loadout, tools: ['subagent', 'ask_question'] }), /nested delegation/);
+    const launch = childLaunch({ id: 'example', sessionFile: '/tmp/session.jsonl', loadout: t.loadout } as any, t.dir, 'pi');
+    assert.ok(launch.args.includes('--no-extensions')); assert.ok(launch.args.includes('--no-context-files'));
+    assert.ok(launch.args.includes('--no-skills')); assert.equal(launch.cwd, t.dir);
+    assert.equal(launch.args[launch.args.indexOf('--tools') + 1], 'read,ask_question');
     assert.throws(() => uniqueName('a\nb', []), /control/);
   } finally { rmSync(t.dir, { recursive: true, force: true }); }
 });
@@ -138,4 +136,105 @@ test('logs and output remain bounded during long tool streams', () => {
   const record = { log: [] } as any;
   for (let i = 0; i < 1000; i++) addLog(record, 'x'.repeat(10000));
   assert.equal(record.log.length, 100); assert.ok(record.log[0].length < 1100);
+});
+
+test('cancel rejects unconfirmed shutdown and retains stopped=false and exclusive lock', async () => {
+  const t = setup();
+  let rpc: RpcProcess | undefined;
+  const manager = new TaskManager(new TaskStore(t.dir), { command: process.execPath, createRpc: launch => {
+    rpc = new RpcProcess({ ...launch, args: [fake] }, 1000, 50);
+    const stop = rpc.stop.bind(rpc);
+    rpc.stop = async () => { await stop(); throw new Error('injected stop confirmation failure'); };
+    return rpc;
+  } });
+  try {
+    const record = await manager.launch({ task: 'SCENARIO_HOLD', ownership: 'a', context: 'none', loadout: t.loadout });
+    await assert.rejects(manager.cancel(record.id), /could not confirm shutdown.*injected stop confirmation failure/s);
+    assert.equal(record.stopped, false);
+    assert.equal(record.state, 'failed');
+    assert.throws(() => manager.store.lock(record.id), /locked/);
+    assert.equal(manager.store.load()[0].stopped, false);
+    await assert.rejects(manager.continue(record.id, 'unsafe'), /not confirmed/);
+  } finally { await manager.shutdown(); await t.clean(); }
+});
+
+test('toolUse requires successful termination evidence for every call in the final batch', async () => {
+  const { EventEmitter } = await import('node:events');
+  for (const scenario of ['terminated', 'missing', 'error', 'mixed', 'stale']) {
+    const t = setup();
+    const rpc = new EventEmitter() as any;
+    rpc.request = async (type: string, fields: any) => {
+      if (type === 'get_commands') return { commands: [{ name: 'rpc-subagent-preflight' }] };
+      if (type === 'get_state') return { isStreaming: false, isCompacting: false, pendingMessageCount: 0 };
+      if (type === 'prompt' && fields.message !== '/rpc-subagent-preflight') rpc.emit('event', { type: 'agent_start' });
+    };
+    rpc.stop = async () => {};
+    const manager = new TaskManager(new TaskStore(t.dir), { command: 'unused', createRpc: () => rpc });
+    const emit = (event: any) => rpc.emit('event', event);
+    const assistant = (ids: string[]) => emit({ type: 'message_end', message: { role: 'assistant', stopReason: 'toolUse', content: ids.map(id => ({ type: 'toolCall', id, name: 'final' })) } });
+    const ended = (id: string, terminate = true, isError = false) => emit({ type: 'tool_execution_end', toolCallId: id, toolName: 'final', result: { terminate, content: [] }, isError });
+    try {
+      const record = await manager.launch({ task: scenario, ownership: 'a', context: 'none', loadout: t.loadout });
+      assistant(['one']);
+      if (scenario === 'mixed') { assistant(['one', 'two']); ended('one'); ended('two', false); }
+      else if (scenario !== 'missing') ended('one', true, scenario === 'error');
+      if (scenario === 'stale') assistant(['later']);
+      emit({ type: 'agent_settled' });
+      await until(() => record.stopped);
+      assert.equal(record.state, scenario === 'terminated' ? 'completed' : 'failed', scenario);
+    } finally { await manager.shutdown(); await t.clean(); }
+  }
+});
+
+test('accepted unstarted reconciliation preserves queued work and rechecks lifecycle races', async () => {
+  const { EventEmitter } = await import('node:events');
+  for (const race of [false, true]) {
+    const t = setup();
+    const rpc = new EventEmitter() as any;
+    let accepted = false, pending = 1, stateReply: ((value: any) => void) | undefined;
+    rpc.request = async (type: string, fields: any) => {
+      if (type === 'get_commands') return { commands: [{ name: 'rpc-subagent-preflight' }] };
+      if (type === 'get_state') {
+        if (race && accepted && !stateReply) return new Promise(resolve => { stateReply = resolve; });
+        return { isStreaming: false, isCompacting: false, pendingMessageCount: accepted ? pending : 0 };
+      }
+      if (type === 'prompt' && fields.message !== '/rpc-subagent-preflight') accepted = true;
+    };
+    rpc.stop = async () => {};
+    const manager = new TaskManager(new TaskStore(t.dir), { command: 'unused', createRpc: () => rpc });
+    try {
+      const record = await manager.launch({ task: 'queued', ownership: 'a', context: 'none', loadout: t.loadout });
+      await sleep(10);
+      assert.equal(record.stopped, false);
+      pending = 0;
+      rpc.emit('event', { type: 'agent_start' });
+      stateReply?.({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 });
+      await sleep(10);
+      assert.equal(record.stopped, false, 'old idle state must not close a newly started run');
+      rpc.emit('event', { type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'stop' } });
+      rpc.emit('event', { type: 'agent_settled' });
+      await until(() => record.stopped);
+      assert.equal(record.state, 'completed');
+    } finally { await manager.shutdown(); await t.clean(); }
+  }
+});
+
+test('late startup rejection cannot release an unconfirmed stopped writer lock', async () => {
+  const { EventEmitter } = await import('node:events');
+  const t = setup(), rpc = new EventEmitter() as any;
+  let rejectStartup!: (error: Error) => void;
+  rpc.request = () => new Promise((_resolve, reject) => { rejectStartup = reject; });
+  rpc.stop = async () => { throw new Error('stop unconfirmed'); };
+  const manager = new TaskManager(new TaskStore(t.dir), { command: 'unused', createRpc: () => rpc });
+  try {
+    const launch = manager.launch({ task: 'starting', ownership: 'a', context: 'none', loadout: t.loadout });
+    const record = [...manager.records.values()][0];
+    rpc.emit('fault', new Error('startup fault'));
+    await until(() => record.activity === 'failed');
+    rejectStartup(new Error('late startup rejection'));
+    await assert.rejects(launch, /late startup/);
+    assert.equal(record.stopped, false);
+    assert.match(record.error!, /stop unconfirmed/);
+    assert.throws(() => manager.store.lock(record.id), /locked/);
+  } finally { await manager.shutdown(); await t.clean(); }
 });

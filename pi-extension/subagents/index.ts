@@ -1,10 +1,10 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Skill } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { discoverAgents, nonempty, resolveLoadout } from "./agents.ts";
-import { snapshotContext, type ContextMode } from "./context.ts";
+import { nonempty, resolveLoadout } from "./loadout.ts";
+import { snapshotContext } from "./context.ts";
 import { TaskStore, bounded } from "./store.ts";
 import { TaskManager } from "./tasks.ts";
 import { detail, resultRenderer, taskMenu, taskSummary, widget } from "./ui.ts";
@@ -17,6 +17,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   let manager: TaskManager | undefined;
   let ctxForWidget: ExtensionContext | undefined;
   let interval: ReturnType<typeof setInterval> | undefined;
+  let skills: Skill[] | undefined;
+  pi.on("before_agent_start", event => { skills = structuredClone(event.systemPromptOptions.skills); });
   const snapshots = new Map<string, AgentMessage[]>();
   function current(): TaskManager {
     if (!manager) throw new Error("Subagents require an active persistent parent session");
@@ -43,6 +45,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (interval) clearInterval(interval);
     interval = undefined;
     snapshots.clear();
+    skills = undefined;
     const old = manager; manager = undefined; ctxForWidget = undefined;
     await old?.shutdown();
   });
@@ -52,28 +55,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("tool_execution_end", event => { snapshots.delete(event.toolCallId); });
   pi.registerTool({
     name: "subagent", label: "Subagent",
-    description: "Launch an asynchronous RPC subagent in the shared working directory. Context modes: none, partial (default; explicit contextText required), full (active branch snapshot). Results/questions arrive automatically. Specify ownership; other agents may write concurrently. No nested delegation. Use subagents_list for roles and subagent_control for inspection/interaction.",
+    description: "Launch an asynchronous RPC subagent in the shared working directory. Context modes: none, partial (default; explicit contextText required), full (active branch snapshot). Results/questions arrive automatically. Specify ownership; other agents may write concurrently. No nested delegation. Inherits parent active nondelegation tools and skills; unreloadable resources fail explicitly. Use subagent_control for inspection/interaction.",
     promptSnippet: "Delegate an owned task with none, partial or full context",
     promptGuidelines: [
       "Assign disjoint file/module ownership when using subagent for parallel writes. Coordinate shared interfaces before dispatch.",
       "After subagent launch, continue independent work or end the turn; results arrive automatically. Do not poll or invent completion.",
     ],
     parameters: Type.Object({
-      agent: Type.String(), task: Type.String({ minLength: 1 }), ownership: Type.String({ minLength: 1, description: "Responsible files/modules; say read-only for investigations" }),
+      task: Type.String({ minLength: 1 }), ownership: Type.String({ minLength: 1, description: "Responsible files/modules; say read-only for investigations" }),
       context: Type.Optional(StringEnum(["none", "partial", "full"] as const)), contextText: Type.Optional(Type.String()),
       name: Type.Optional(Type.String()), model: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()),
-    }),
+    }, { additionalProperties: false }),
     async execute(id, params, signal, _update, ctx) {
       signal?.throwIfAborted();
       const m = current();
-      const agent = discoverAgents(ctx.cwd, ctx.isProjectTrusted()).find(a => a.name === params.agent);
-      if (!agent) throw new Error(`Unknown role ${params.agent}; use subagents_list`);
-      const requested = params.model ?? agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "");
+      const requested = params.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "");
       const slash = requested.indexOf("/");
       if (slash < 1) throw new Error("Use a canonical provider/model ID");
       const model = ctx.modelRegistry.find(requested.slice(0, slash), requested.slice(slash + 1));
       if (!model) throw new Error(`Model not found: ${requested}`);
-      const loadout = resolveLoadout(agent, resolve(ctx.cwd, params.cwd ?? agent.cwd ?? "."), `${model.provider}/${model.id}`, agent.thinking ?? ctx.thinkingLevel ?? "medium");
+      const loadout = resolveLoadout(pi, skills, resolve(ctx.cwd, params.cwd ?? "."), `${model.provider}/${model.id}`, ctx.thinkingLevel ?? "medium");
       const mode = params.context ?? "partial";
       const snapshot = mode === "full" ? snapshots.get(id) ?? snapshotContext(ctx.sessionManager) : undefined;
       snapshots.delete(id);
@@ -84,13 +85,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       // Tool cancellation during startup must not leave an unacknowledged writer behind.
       if (signal?.aborted) { await m.cancel(record.id); signal.throwIfAborted(); }
       return result(`Task accepted (not completed): ${taskSummary(record)}\nSession: ${record.sessionFile}`);
-    },
-  });
-  pi.registerTool({
-    name: "subagents_list", label: "Subagent roles", description: "List available role profiles. Context modes are independent of roles.",
-    parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _update, ctx) {
-      return result(discoverAgents(ctx.cwd, ctx.isProjectTrusted()).map(a => `${a.name}: ${a.description}\nTools: ${a.tools.join(", ") || "none"}`).join("\n\n"));
     },
   });
   pi.registerTool({

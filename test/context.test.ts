@@ -98,3 +98,20 @@ test("taskPrompt injects cooperative guidelines, context mode, and ownership for
   assert.throws(() => taskPrompt('task', 'src/*', 'full', 'accidental text'), /contextText is only supported in partial mode/);
   assert.throws(() => taskPrompt('task', 'src/*', 'invalid' as any), /Invalid context mode/);
 });
+
+test("closePendingCalls preserves error/aborted assistants without orphan provider results", async () => {
+  const { transformMessages } = await import("@earendil-works/pi-ai/api/transform-messages");
+  for (const stopReason of ["error", "aborted"] as const) {
+    const messages: any[] = [
+      { role: "user", content: "interrupted task", timestamp: 0 },
+      { role: "assistant", api: "openai-responses", provider: "openai", model: "fixture", stopReason,
+        content: [{ type: "toolCall", id: "unexecuted", name: "read", arguments: { path: "a" } }], timestamp: 1 },
+      { role: "user", content: "later dispatch", timestamp: 2 },
+    ];
+    const closed = closePendingCalls(messages);
+    assert.deepEqual(closed, messages);
+    const transformed = transformMessages(closed as any, { api: "openai-responses", provider: "openai", id: "fixture", input: ["text"] } as any);
+    assert.equal(transformed.some(m => m.role === "toolResult"), false);
+    assert.deepEqual(transformed.map(m => m.role), ["user", "user"]);
+  }
+});

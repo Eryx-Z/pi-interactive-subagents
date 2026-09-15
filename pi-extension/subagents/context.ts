@@ -32,7 +32,7 @@ export function closePendingCalls(messages: AgentMessage[]): AgentMessage[] {
   for (const message of structuredClone(messages)) {
     if (message.role !== "toolResult") flush();
     result.push(message);
-    if (message.role === "assistant" && Array.isArray(message.content)) {
+    if (message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted" && Array.isArray(message.content)) {
       for (const block of message.content) if (block.type === "toolCall") pending.set(block.id, block.name);
     } else if (message.role === "toolResult") pending.delete(message.toolCallId);
   }

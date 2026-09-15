@@ -1,13 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RpcProcess } from "../pi-extension/subagents/rpc.ts";
-import { childLaunch } from "../pi-extension/subagents/tasks.ts";
+import { TaskManager, childLaunch } from "../pi-extension/subagents/tasks.ts";
 import { seedSession } from "../pi-extension/subagents/context.ts";
-import type { Loadout } from "../pi-extension/subagents/agents.ts";
+import { loadout as makeLoadout } from "./fixtures/loadout.ts";
+import { TaskStore } from "../pi-extension/subagents/store.ts";
 import type { TaskRecord } from "../pi-extension/subagents/store.ts";
 
 // Real installed Pi protocol/extension loader, but ONLY command prompts: no provider call.
@@ -39,7 +40,7 @@ test("real Pi child preflight validates selected model and tools without invokin
   const dir = mkdtempSync(join(tmpdir(), "rpc-child-host-"));
   const sessionFile = join(dir, "child.jsonl");
   seedSession(sessionFile, dir, "none");
-  const loadout: Loadout = { version: 1, agent: "scout", tools: ["read", "ask_question"], extensions: [], model: "anthropic/claude-sonnet-4-6", thinking: "off", prompt: "Read only", promptMode: "append", cwd: dir, agentDir: dir };
+  const loadout = makeLoadout(dir, "anthropic/claude-sonnet-4-6");
   const launch = childLaunch({ id: "test", sessionFile, loadout } as TaskRecord, dir, process.execPath, [cli]);
   launch.env = { ...launch.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" };
   const rpc = new RpcProcess(launch);
@@ -53,4 +54,36 @@ test("real Pi child preflight validates selected model and tools without invokin
     assert.deepEqual(errors, []);
     assert.equal((await rpc.request("get_state")).messageCount, 0);
   } finally { await rpc.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("real child inheritance failures stop before any model task, including builtin fallback and skill drift", { timeout: 30000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "rpc-child-mismatch-"));
+  const missingProvider = join(dir, "empty-extension.ts");
+  writeFileSync(missingProvider, "export default function () {}\n");
+  const skillPath = join(dir, "skill.md");
+  writeFileSync(skillPath, "---\nname: changed\ndescription: Changed on disk\n---\nSkill instructions");
+  const manager = new TaskManager(new TaskStore(dir), {
+    command: process.execPath, baseArgs: [cli],
+    createRpc: launch => new RpcProcess({ ...launch, env: { ...launch.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" } }),
+  });
+  try {
+    for (const scenario of ["schema", "fallback", "skill", "model"] as const) {
+      const loadout = makeLoadout(dir, "anthropic/claude-sonnet-4-6");
+      if (scenario === "schema") loadout.toolMetadata[0].description = "Different from runtime";
+      if (scenario === "fallback") {
+        loadout.toolMetadata[0].source = "extension"; loadout.toolMetadata[0].path = missingProvider; loadout.extensions = [missingProvider];
+      }
+      if (scenario === "skill") loadout.skills = [{ name: "changed", description: "Original parent metadata", filePath: skillPath, baseDir: dir, disableModelInvocation: false }];
+      if (scenario === "model") loadout.model = "unregistered-provider/missing-model";
+      await assert.rejects(manager.launch({ name: scenario, task: "Never send this to a provider", ownership: "read-only", context: "none", loadout }));
+      const record = manager.get(scenario);
+      assert.equal(record.state, "failed"); assert.equal(record.stopped, scenario !== "model");
+      assert.match(record.error!, scenario === "skill" ? /skill inventory\/metadata mismatch/ : scenario === "model" ? /model|Model/ : /schema\/provenance mismatch/);
+      // Pi removes empty session files during graceful disposal.
+      const transcript = existsSync(record.sessionFile) ? readFileSync(record.sessionFile, "utf8") : "";
+      const messages = transcript.split("\n").filter(Boolean).map(s => JSON.parse(s)).filter(e => e.type === "message");
+      assert.equal(messages.length, 0, "Preflight failure must not submit the task to a model");
+      assert.equal(transcript.includes("Never send this"), false);
+    }
+  } finally { await manager.shutdown(); rmSync(dir, { recursive: true, force: true }); }
 });

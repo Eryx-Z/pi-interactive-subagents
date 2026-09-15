@@ -4,21 +4,24 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import bridge from "../pi-extension/subagents/child.ts";
+import { loadout as makeLoadout, readInfo } from "./fixtures/loadout.ts";
+import { CHILD_EXTENSION } from "../pi-extension/subagents/loadout.ts";
 import entry from "../pi-extension/subagents/index.ts";
 
 test('child question tool awaits RPC UI answer, respects abort and enforces sequential execution', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'child-'));
   const previous = process.env.PI_RPC_SUBAGENT_LOADOUT;
   const path = join(dir, 'loadout.json');
-  writeFileSync(path, JSON.stringify({ version: 1, agent: 'test', tools: ['read', 'ask_question'], extensions: [], model: 'fake/test', thinking: 'off', prompt: '', promptMode: 'append', cwd: dir, agentDir: dir }));
+  writeFileSync(path, JSON.stringify(makeLoadout(dir)));
   process.env.PI_RPC_SUBAGENT_LOADOUT = path;
   try {
     const tools: any[] = [], handlers: Record<string, any> = {}, commands: Record<string, any> = {};
     let active: string[] = [];
     bridge({ registerTool: (t: any) => tools.push(t), registerCommand: (name: string, c: any) => commands[name] = c,
-      on: (name: string, h: any) => handlers[name] = h, getAllTools: () => [{name: 'read'}, {name: 'ask_question'}],
+      on: (name: string, h: any) => handlers[name] = h, getAllTools: () => [readInfo(dir), {name: 'ask_question', sourceInfo: {path: CHILD_EXTENSION}}],
       setActiveTools: (t: string[]) => active = t, getActiveTools: () => active,
     } as any);
+    handlers.session_start();
     const q = tools[0]; assert.equal(q.executionMode, 'sequential');
     let answer!: (value: string) => void;
     let completed = false;
@@ -29,9 +32,9 @@ test('child question tool awaits RPC UI answer, respects abort and enforces sequ
     answer('Choice A'); assert.equal((await pending).content[0].text, 'Choice A');
     await assert.rejects(q.execute('q', {question: 'Which?'}, AbortSignal.abort(), undefined, {mode: 'rpc', ui: { input: async () => undefined }}), /cancelled/);
     assert.equal(handlers.tool_call({toolName: 'subagent'}).block, true);
-    await commands['rpc-subagent-preflight'].handler('', {model: {provider: 'fake', id: 'test'}});
+    await commands['rpc-subagent-preflight'].handler('', {model: {provider: 'fake', id: 'test'}, getSystemPromptOptions: () => ({skills: []})});
     assert.deepEqual(active, ['read', 'ask_question']);
-    await assert.rejects(commands['rpc-subagent-preflight'].handler('', {model: {provider: 'other', id: 'model'}}), /not selected/);
+    await assert.rejects(commands['rpc-subagent-preflight'].handler('', {model: {provider: 'other', id: 'model'}, getSystemPromptOptions: () => ({skills: []})}), /not selected/);
   } finally {
     if (previous === undefined) delete process.env.PI_RPC_SUBAGENT_LOADOUT; else process.env.PI_RPC_SUBAGENT_LOADOUT = previous;
     rmSync(dir, { recursive: true, force: true });
@@ -41,9 +44,11 @@ test('parent extension exposes discoverable control/UI; cannot register spawning
   const tools: any[] = [], commands: string[] = [], events: string[] = [];
   const api = { on: (name: string) => events.push(name), registerTool: (t: any) => tools.push(t), registerCommand: (name: string) => commands.push(name), registerMessageRenderer() {} } as any;
   entry(api);
-  assert.deepEqual(tools.map(t => t.name), ['subagent', 'subagents_list', 'subagent_control']);
+  assert.deepEqual(tools.map(t => t.name), ['subagent', 'subagent_control']);
   assert.ok(commands.includes('subagents')); assert.ok(events.includes('session_shutdown'));
   assert.equal(tools[0].parameters.properties.contextText.type, 'string');
+  assert.equal(tools[0].parameters.properties.agent, undefined);
+  assert.equal(tools[0].parameters.additionalProperties, false);
   const previous = process.env.PI_RPC_SUBAGENT_CHILD;
   process.env.PI_RPC_SUBAGENT_CHILD = '1';
   try { entry({} as any); }
