@@ -75,7 +75,7 @@ test("real child inheritance failures stop before any model task, including buil
       }
       if (scenario === "skill") loadout.skills = [{ name: "changed", description: "Original parent metadata", filePath: skillPath, baseDir: dir, disableModelInvocation: false }];
       if (scenario === "model") loadout.model = "unregistered-provider/missing-model";
-      await assert.rejects(manager.launch({ name: scenario, task: "Never send this to a provider", ownership: "read-only", context: "none", loadout }));
+      await assert.rejects(manager.launch({ name: scenario, task: "Never send this to a provider", access: "full", context: "none", loadout }));
       const record = manager.get(scenario);
       assert.equal(record.state, "failed"); assert.equal(record.stopped, scenario !== "model");
       assert.match(record.error!, scenario === "skill" ? /skill inventory\/metadata mismatch/ : scenario === "model" ? /model|Model/ : /schema\/provenance mismatch/);

@@ -1,20 +1,21 @@
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { RpcProcess, type RpcEvent, type RpcLaunch } from "./rpc.ts";
-import { CHILD_EXTENSION, validateLoadout, type Loadout } from "./loadout.ts";
+import { CHILD_EXTENSION, validateLoadout, applyAccess, accessMode, type AccessMode, type Loadout } from "./loadout.ts";
 import { atomicWrite, addLog, bounded, uniqueName, TaskStore, type TaskRecord } from "./store.ts";
 import { COOPERATION, seedSession, taskPrompt, type ContextMode } from "./context.ts";
 import type { AgentMessage } from "./context.ts";
 
 export interface NewTask {
-  name?: string; task: string; ownership: string; context: ContextMode; contextText?: string;
+  name?: string; task: string; access: AccessMode; context: ContextMode; contextText?: string;
+  workflow?: { id: string; stepId: string };
   loadout: Loadout; snapshot?: AgentMessage[]; parentSession?: string;
 }
 interface LiveRun {
   rpc: RpcProcess; release: () => void; finishing?: Promise<void>; pendingMessages: number;
   settled: boolean; lastStop?: string; lastError?: string; started: boolean; askToolCallId?: string;
   persistTimer?: ReturnType<typeof setTimeout>; settleChecking?: boolean; checkAgain?: boolean;
-  finalTools: Map<string, boolean>;
+  finalTools: Map<string, boolean>; finalOutput: Map<string, string>; submission: number;
 }
 export function childLaunch(record: TaskRecord, dir: string, command: string, baseArgs: string[] = []): RpcLaunch {
   const l = validateLoadout(record.loadout);
@@ -34,7 +35,7 @@ export function childLaunch(record: TaskRecord, dir: string, command: string, ba
       "--tools", l.tools.join(","), "--model", l.model, "--thinking", l.thinking,
       "--append-system-prompt", promptPath,
       ...l.skills.flatMap(s => ["--skill", s.loadPath ?? s.filePath]),
-      "-e", CHILD_EXTENSION, ...l.extensions.flatMap(p => ["-e", p])],
+      "-e", CHILD_EXTENSION, ...[...new Set([...(l.providerExtensions ?? []), ...l.extensions])].flatMap(p => ["-e", p])],
   };
 }
 function text(message: any): string {
@@ -44,6 +45,9 @@ export class TaskManager {
   readonly records = new Map<string, TaskRecord>();
   private live = new Map<string, LiveRun>();
   private closed = false;
+  private listeners = new Set<() => void>();
+  subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
+  isLive(id: string): boolean { return this.live.has(id); }
   constructor(readonly store: TaskStore, private options: {
     command: string; baseArgs?: string[];
     createRpc?: (launch: RpcLaunch) => RpcProcess;
@@ -53,6 +57,7 @@ export class TaskManager {
   }
   private save(record: TaskRecord): void {
     record.updatedAt = Date.now(); this.store.save(record); this.options.changed?.();
+    for (const listener of this.listeners) listener();
   }
   get(id: string): TaskRecord {
     const record = this.records.get(id) ?? [...this.records.values()].find(r => r.name === id);
@@ -61,13 +66,14 @@ export class TaskManager {
   }
   async launch(input: NewTask): Promise<TaskRecord> {
     if (this.closed) throw new Error("Parent session is shutting down");
-    if (!input.task.trim() || !input.ownership.trim()) throw new Error("Task and ownership are required");
-    const prompt = taskPrompt(input.task, input.ownership, input.context, input.contextText);
+    if (!input.task.trim()) throw new Error("Task is required");
+    const prompt = taskPrompt(input.task, input.access, input.context, input.contextText);
     validateLoadout(input.loadout);
     const id = randomUUID();
     const record: TaskRecord = {
-      version: 1, id, name: uniqueName(input.name ?? input.context, [...this.records.values()].map(r => r.name)),
-      task: input.task, ownership: input.ownership, context: input.context, loadout: structuredClone(input.loadout),
+      version: 2, id, name: uniqueName(input.name ?? input.context, [...this.records.values()].map(r => r.name)),
+      task: input.task, access: input.access, context: input.context, loadout: applyAccess(input.loadout, input.access),
+      availableLoadout: structuredClone(input.loadout), workflow: input.workflow,
       state: "running", startedAt: Date.now(), updatedAt: Date.now(), sessionFile: join(this.store.dir, `${id}.session.jsonl`),
       output: "", activity: "starting RPC", log: [], questions: [], stopped: false, run: 1,
     };
@@ -80,19 +86,24 @@ export class TaskManager {
     await this.start(record, prompt);
     return record;
   }
-  async continue(id: string, message: string): Promise<TaskRecord> {
+  async continue(id: string, message: string, access?: AccessMode, workflowId?: string): Promise<TaskRecord> {
     if (this.closed) throw new Error("Parent session is shutting down");
     if (!message.trim()) throw new Error("Continuation message is required");
     const record = this.get(id);
+    if (record.workflow && record.workflow.id !== workflowId) throw new Error("Use workflow_control retry for workflow steps");
+    const selected = accessMode(access ?? record.access);
+    const available = record.availableLoadout ?? record.loadout;
+    const effective = applyAccess(available, selected);
     if (this.live.has(record.id)) throw new Error("Task is already running or stopping");
     this.store.validateForContinue(record);
     const release = this.store.lock(record.id);
+    record.version = 2; record.access = selected; record.availableLoadout = structuredClone(available); record.loadout = effective;
     record.state = "running"; record.stopped = false; record.run++; record.error = undefined;
     record.questions = []; record.output = ""; record.startedAt = Date.now(); record.activity = "starting continuation";
     addLog(record, `Continuation ${record.run}: ${message}`);
     try { this.save(record); }
     catch (e) { release(); record.state = "failed"; record.stopped = true; throw e; }
-    await this.start(record, `${COOPERATION}\nOwnership: ${record.ownership}\nContinuation task:\n${message}`, release);
+    await this.start(record, `${COOPERATION}\nAccess: ${record.access}\nContinuation task:\n${message}`, release);
     return record;
   }
   private async start(record: TaskRecord, prompt: string, reserved?: () => void): Promise<void> {
@@ -102,7 +113,7 @@ export class TaskManager {
       release ??= this.store.lock(record.id);
       const launch = childLaunch(record, this.store.dir, this.options.command, this.options.baseArgs);
       const rpc = (this.options.createRpc ?? (l => new RpcProcess(l)))(launch);
-      const live: LiveRun = { rpc, release, pendingMessages: 1, settled: false, started: false, finalTools: new Map() };
+      const live: LiveRun = { rpc, release, pendingMessages: 1, settled: false, started: false, finalTools: new Map(), finalOutput: new Map(), submission: 0 };
       this.live.set(record.id, live);
       spawned = true;
       rpc.on("event", event => {
@@ -142,6 +153,7 @@ export class TaskManager {
     if (event.type === "message_end" && event.message?.role === "assistant") {
       record.output = bounded(text(event.message)); live.lastStop = event.message.stopReason; live.lastError = event.message.errorMessage;
       live.finalTools = new Map((event.message.content ?? []).filter((b: any) => b.type === "toolCall").map((b: any) => [b.id, false]));
+      live.finalOutput.clear();
       addLog(record, `Assistant: ${record.output}`);
     }
     if (event.type === "tool_execution_start") {
@@ -151,7 +163,11 @@ export class TaskManager {
     }
     if (event.type === "tool_execution_update") record.activity = `${event.toolName}: ${bounded(text(event.partialResult), 200)}`;
     if (event.type === "tool_execution_end") {
-      if (live.finalTools.has(event.toolCallId)) live.finalTools.set(event.toolCallId, event.result?.terminate === true && event.isError === false);
+      if (live.finalTools.has(event.toolCallId)) {
+        const terminating = event.result?.terminate === true && event.isError === false;
+        live.finalTools.set(event.toolCallId, terminating);
+        if (terminating) live.finalOutput.set(event.toolCallId, bounded(text(event.result)));
+      }
       if (event.toolName === "ask_question") live.askToolCallId = undefined;
       addLog(record, `${event.isError ? "Failed" : "Done"} ${event.toolName} (${event.toolCallId}): ${text(event.result)}`);
       if (event.toolName === "ask_question") record.questions = record.questions.filter(q => q.toolCallId !== event.toolCallId);
@@ -191,7 +207,9 @@ export class TaskManager {
     // A supplement can race an older run's agent_settled. Query after all prompt receipts,
     // then recheck local counters before closing a session that may now be running again.
     live.settleChecking = true;
+    const submission = live.submission;
     void live.rpc.request("get_state").then(state => {
+      if (submission !== live.submission) { live.checkAgain = true; return; }
       if (!live.finishing && (!live.started || live.settled) && live.pendingMessages === 0 && !record.questions.length &&
           state?.isStreaming === false && !state.isCompacting && !state.pendingMessageCount) {
         if (!live.started) {
@@ -199,6 +217,7 @@ export class TaskManager {
           return;
         }
         const terminated = live.lastStop === "toolUse" && live.finalTools.size > 0 && [...live.finalTools.values()].every(Boolean);
+        if (terminated) record.output = bounded([record.output, ...[...live.finalTools.keys()].map(id => live.finalOutput.get(id))].filter(Boolean).join("\n"));
         const final = live.lastStop === "aborted" ? "cancelled" : live.lastStop === "stop" || terminated ? "completed" : "failed";
         void this.finish(record, final, final === "failed" ? live.lastError ?? `Run settled with stopReason=${live.lastStop ?? "missing"}` : undefined);
       }
@@ -230,6 +249,10 @@ export class TaskManager {
     const record = this.get(id), live = this.live.get(record.id);
     if (!live || live.finishing) throw new Error("Task is not running; use continue explicitly");
     if (record.questions.length) throw new Error("Task is waiting for an answer; reply with its question ID");
+    // A settled run cannot prove that a new submission started. Input hooks may
+    // consume it without emitting another agent_start/agent_settled pair.
+    if (live.settled) live.started = false;
+    live.submission++;
     live.pendingMessages++; live.settled = false;
     try {
       await live.rpc.request("prompt", { message: `Supplementary parent instruction:\n${message}`, streamingBehavior: "steer" });

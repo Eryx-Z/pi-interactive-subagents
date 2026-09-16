@@ -31,7 +31,7 @@ test('child question tool awaits RPC UI answer, respects abort and enforces sequ
     await new Promise(r => setTimeout(r, 10)); assert.equal(completed, false);
     answer('Choice A'); assert.equal((await pending).content[0].text, 'Choice A');
     await assert.rejects(q.execute('q', {question: 'Which?'}, AbortSignal.abort(), undefined, {mode: 'rpc', ui: { input: async () => undefined }}), /cancelled/);
-    assert.equal(handlers.tool_call({toolName: 'subagent'}).block, true);
+    for (const toolName of ['subagent', 'workflow_run', 'workflow_control', 'bash', 'write']) assert.equal(handlers.tool_call({toolName}).block, true);
     await commands['rpc-subagent-preflight'].handler('', {model: {provider: 'fake', id: 'test'}, getSystemPromptOptions: () => ({skills: []})});
     assert.deepEqual(active, ['read', 'ask_question']);
     await assert.rejects(commands['rpc-subagent-preflight'].handler('', {model: {provider: 'other', id: 'model'}, getSystemPromptOptions: () => ({skills: []})}), /not selected/);
@@ -44,10 +44,13 @@ test('parent extension exposes discoverable control/UI; cannot register spawning
   const tools: any[] = [], commands: string[] = [], events: string[] = [];
   const api = { on: (name: string) => events.push(name), registerTool: (t: any) => tools.push(t), registerCommand: (name: string) => commands.push(name), registerMessageRenderer() {} } as any;
   entry(api);
-  assert.deepEqual(tools.map(t => t.name), ['subagent', 'subagent_control']);
+  assert.deepEqual(tools.map(t => t.name), ['subagent', 'subagent_control', 'workflow_run', 'workflow_control']);
   assert.ok(commands.includes('subagents')); assert.ok(events.includes('session_shutdown'));
   assert.equal(tools[0].parameters.properties.contextText.type, 'string');
   assert.equal(tools[0].parameters.properties.agent, undefined);
+  assert.equal(tools[0].parameters.properties.ownership, undefined);
+  assert.ok(tools[0].parameters.required.includes('access'));
+  assert.ok(commands.includes('workflows'));
   assert.equal(tools[0].parameters.additionalProperties, false);
   const previous = process.env.PI_RPC_SUBAGENT_CHILD;
   process.env.PI_RPC_SUBAGENT_CHILD = '1';

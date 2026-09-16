@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { taskMenu, widget, resultRenderer } from "../pi-extension/subagents/ui.ts";
 
 function setup() {
-  const record: any = { id: "task-id", name: "auth work", state: "running", loadout: { cwd: "/project" }, context: "partial", run: 1, ownership: "src/auth", sessionFile: "/tmp/session.jsonl", task: "fix auth", startedAt: Date.now(), updatedAt: Date.now(), activity: "read: auth.ts", output: "working", log: [], questions: [] };
+  const record: any = { id: "task-id", name: "auth work", state: "running", loadout: { cwd: "/project" }, context: "partial", run: 1, access: "full", sessionFile: "/tmp/session.jsonl", task: "fix auth", startedAt: Date.now(), updatedAt: Date.now(), activity: "read: auth.ts", output: "working", log: [], questions: [] };
   const calls: any[] = [], notices: string[] = [];
   const manager: any = {
     records: new Map([[record.id, record]]),
@@ -40,9 +40,9 @@ test("task menu routes correlated answers and avoids empty question dialogs", as
 test("task menu controls cancellation and explicit continuation", async () => {
   const t = setup(); t.selections.push("Cancel");
   await taskMenu(t.manager, t.ctx, "task-id");
-  t.selections.push("Continue");
+  t.selections.push("Continue", "read-only");
   await taskMenu(t.manager, t.ctx, "task-id");
-  assert.deepEqual(t.calls, [["cancel", "task-id"], ["continue", "task-id", "extra requirement"]]);
+  assert.deepEqual(t.calls, [["cancel", "task-id"], ["continue", "task-id", "extra requirement", "read-only"]]);
 });
 test("widget updates activity and headless mode has no terminal requirements", async () => {
   const t = setup(); widget(t.manager, t.ctx);

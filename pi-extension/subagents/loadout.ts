@@ -7,7 +7,23 @@ import { isDeepStrictEqual } from "node:util";
 
 export const CHILD_EXTENSION = join(dirname(fileURLToPath(import.meta.url)), "child.ts");
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"]);
-const DELEGATION_TOOLS = new Set(["subagent", "subagent_message", "subagents_list", "subagent_control", "delegate", "delegate_task"]);
+const DELEGATION_TOOLS = new Set(["subagent", "subagent_message", "subagents_list", "subagent_control", "delegate", "delegate_task", "workflow_run", "workflow_control"]);
+export type AccessMode = "read-only" | "full";
+export function accessMode(value: unknown): AccessMode {
+  if (value !== "read-only" && value !== "full") throw new Error("access must be read-only or full");
+  return value;
+}
+/** Conservative tool restriction, not a filesystem sandbox. Never trust a tool name alone. */
+export function applyAccess(loadout: Loadout, access: AccessMode): Loadout {
+  accessMode(access);
+  const l = structuredClone(validateLoadout(loadout));
+  if (access === "read-only") {
+    l.toolMetadata = l.toolMetadata.filter(t => t.source === "builtin" && ["read", "grep", "find", "ls"].includes(t.name));
+    l.tools = [...l.toolMetadata.map(t => t.name), "ask_question"];
+    l.extensions = [];
+  }
+  return validateLoadout(l);
+}
 type ToolInfo = ReturnType<ExtensionAPI["getAllTools"]>[number];
 export interface ToolSnapshot {
   name: string; description: string; parameters: ToolInfo["parameters"]; promptGuidelines?: string[];
@@ -21,6 +37,8 @@ export interface SkillSnapshot {
 export interface Loadout {
   version: 2; tools: string[]; toolMetadata: ToolSnapshot[]; extensions: string[]; skills: SkillSnapshot[];
   model: string; thinking: string; cwd: string; agentDir: string;
+  /** Explicitly advertised provider-only entrypoints; independent of tool access. */
+  providerExtensions?: string[];
 }
 export function nonempty(value: unknown, field: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${field} must be a nonempty string`);
@@ -53,7 +71,7 @@ export function snapshotSkills(skills: readonly Skill[]): SkillSnapshot[] {
     loadPath: s.filePath, baseDir: realpathSync(s.baseDir), disableModelInvocation: s.disableModelInvocation }));
 }
 /** Inputs come from the live parent API and prompt options, never resource rediscovery. */
-export function resolveLoadout(pi: Pick<ExtensionAPI, "getActiveTools" | "getAllTools">, skills: readonly Skill[] | undefined,
+export function resolveLoadout(pi: Pick<ExtensionAPI, "getActiveTools" | "getAllTools"> & Partial<Pick<ExtensionAPI, "events">>, skills: readonly Skill[] | undefined,
   cwd: string, model: string, thinking: string, configDir = getAgentDir()): Loadout {
   if (!skills) throw new Error("Parent skill inventory is unavailable; launch during a parent agent turn");
   const all = new Map(pi.getAllTools().map(t => [t.name, t]));
@@ -63,7 +81,12 @@ export function resolveLoadout(pi: Pick<ExtensionAPI, "getActiveTools" | "getAll
     if (!tool) throw new Error(`Cannot inherit active tool ${name}: runtime metadata is missing`);
     return snapshotTool(tool);
   });
+  const providerExtensions: string[] = [];
+  // Opt-in synchronous discovery. Only trusted loaded extensions may advertise an entrypoint.
+  pi.events?.emit("rpc-subagents:provider-source:v1", { provider: model.split("/")[0],
+    register: (path: string) => { providerExtensions.push(file(path, "model provider")); } });
   return validateLoadout({ version: 2, tools: [...names, "ask_question"], toolMetadata,
+    ...(providerExtensions.length ? { providerExtensions: [...new Set(providerExtensions)] } : {}),
     extensions: [...new Set(toolMetadata.filter(t => t.source === "extension").map(t => t.path))],
     skills: snapshotSkills(skills), model, thinking, cwd: realpathSync(cwd), agentDir: resolve(configDir) });
 }
@@ -87,6 +110,9 @@ export function validateLoadout(value: unknown): Loadout {
   }
   const extensions = [...new Set(l.toolMetadata.filter(t => t.source === "extension").map(t => t.path))];
   if (!isDeepStrictEqual(l.extensions, extensions)) throw new Error("Extension sources do not match inherited tools");
+  if (l.providerExtensions !== undefined && (!Array.isArray(l.providerExtensions) ||
+      new Set(l.providerExtensions).size !== l.providerExtensions.length ||
+      l.providerExtensions.some(p => file(p, "model provider") !== p))) throw new Error("Invalid provider entrypoints");
   const names = new Set<string>();
   for (const s of l.skills) {
     nonempty(s.name, "skill.name"); nonempty(s.description, "skill.description");

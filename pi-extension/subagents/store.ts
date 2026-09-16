@@ -1,13 +1,16 @@
 import { mkdirSync, writeFileSync, renameSync, readFileSync, readdirSync, existsSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { validateLoadout, type Loadout } from "./loadout.ts";
+import { validateLoadout, type Loadout, type AccessMode } from "./loadout.ts";
 import type { ContextMode } from "./context.ts";
 
 export type TaskState = "running" | "waiting" | "completed" | "failed" | "cancelled";
 export interface Question { id: string; title: string; toolCallId?: string; responseSent?: boolean }
 export interface TaskRecord {
-  version: 1; id: string; name: string; task: string; ownership: string; context: ContextMode;
+  version: 1 | 2; id: string; name: string; task: string; context: ContextMode;
+  /** Legacy ownership is retained for inspection only; never inferred as access. */
+  ownership?: string; access?: AccessMode; availableLoadout?: Loadout;
+  workflow?: { id: string; stepId: string };
   state: TaskState; startedAt: number; updatedAt: number; sessionFile: string;
   loadout: Loadout; output: string; activity: string; log: string[]; questions: Question[];
   error?: string; stopped: boolean; run: number;
@@ -19,6 +22,23 @@ export function atomicWrite(path: string, text: string): void {
     writeFileSync(temp, text, { mode: 0o600 });
     renameSync(temp, path);
   } finally { if (existsSync(temp)) unlinkSync(temp); }
+}
+export function toolHistory(record: TaskRecord, limit = 20): string {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("History limit must be 1–100");
+  if (!existsSync(record.sessionFile)) return `No session transcript yet: ${record.sessionFile}`;
+  const entries: string[] = [];
+  const lines = readFileSync(record.sessionFile, "utf8").split("\n");
+  for (const [index, line] of lines.entries()) {
+    if (!line.trim()) continue;
+    let entry: any;
+    try { entry = JSON.parse(line); }
+    catch { if (index === lines.length - 1) continue; throw new Error("Malformed session transcript"); }
+    const m = entry.message;
+    if (m?.role === "assistant" && Array.isArray(m.content)) {
+      for (const b of m.content) if (b.type === "toolCall") entries.push(`${entry.timestamp ?? ""} CALL ${b.id} ${b.name}: ${bounded(JSON.stringify(b.arguments), 1000)}`);
+    } else if (m?.role === "toolResult") entries.push(`${entry.timestamp ?? ""} RESULT ${m.toolCallId} ${m.toolName}${m.isError ? " ERROR" : ""}: ${bounded(JSON.stringify(m.content), 1000)}`);
+  }
+  return `Task: ${record.id}\nSession: ${record.sessionFile}\nTool operations (not a complete filesystem change audit):\n${entries.slice(-limit).join("\n") || "No tool operations recorded"}`;
 }
 export function terminal(state: TaskState): boolean { return ["completed", "failed", "cancelled"].includes(state); }
 export function bounded(text: string, max = 12000): string {
@@ -45,8 +65,8 @@ export class TaskStore {
   load(): TaskRecord[] {
     return readdirSync(this.dir).filter(f => /^[a-f0-9-]{36}\.json$/.test(f)).map(f => {
       const r = JSON.parse(readFileSync(join(this.dir, f), "utf8")) as TaskRecord;
-      if (r.version !== 1 || `${r.id}.json` !== f || typeof r.name !== "string" || typeof r.task !== "string" ||
-          typeof r.ownership !== "string" || typeof r.sessionFile !== "string" ||
+      if (![1, 2].includes(r.version) || `${r.id}.json` !== f || typeof r.name !== "string" || typeof r.task !== "string" ||
+          (r.version === 1 ? typeof r.ownership !== "string" : !["read-only", "full"].includes(r.access ?? "")) || typeof r.sessionFile !== "string" ||
           !["none", "partial", "full"].includes(r.context) || !["running", "waiting", "completed", "failed", "cancelled"].includes(r.state) ||
           typeof r.stopped !== "boolean" || !Number.isInteger(r.run) || !Array.isArray(r.log) || !Array.isArray(r.questions)) throw new Error(`Invalid task record: ${f}`);
       // Do not reconstruct a live writer from disk. Even after a parent crash it must be inspected, not resumed.

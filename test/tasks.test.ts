@@ -25,7 +25,7 @@ function setup() {
 test('parallel tasks reserve explicit names, stream progress and settle exactly once', async () => {
   const t = setup();
   try {
-    const [a, b] = await Promise.all(['a', 'b'].map(s => t.manager.launch({ name: 'same', task: s, ownership: s, context: 'none', loadout: t.loadout })));
+    const [a, b] = await Promise.all(['a', 'b'].map(s => t.manager.launch({ name: 'same', task: s, access: "full", context: 'none', loadout: t.loadout })));
     assert.equal(a.name, 'same'); assert.equal(b.name, 'same-2');
     await until(() => a.stopped && b.stopped);
     assert.equal(a.state, 'completed'); assert.match(a.output, /finished/);
@@ -33,10 +33,25 @@ test('parallel tasks reserve explicit names, stream progress and settle exactly 
     assert.equal(t.events.filter(e => e.includes(':result:')).length, 2);
   } finally { await t.clean(); }
 });
+test('legacy records remain readable but require explicit access before continuation', async () => {
+  const t = setup(); let restored: TaskManager | undefined;
+  try {
+    const r = await t.manager.launch({ task: 'initial', access: 'full', context: 'none', loadout: t.loadout });
+    await until(() => r.stopped); await t.manager.shutdown();
+    r.version = 1; r.ownership = 'historical scope'; delete r.access; delete r.availableLoadout;
+    t.manager.store.save(r); restored = t.create();
+    assert.equal(restored.get(r.id).ownership, 'historical scope');
+    await assert.rejects(restored.continue(r.id, 'explain'), /access must/);
+    const continued = await restored.continue(r.id, 'explain', 'read-only');
+    await until(() => continued.stopped);
+    assert.equal(continued.version, 2); assert.equal(continued.access, 'read-only');
+    assert.deepEqual(continued.loadout.tools, ['read', 'ask_question']);
+  } finally { await restored?.shutdown(); await t.clean(); }
+});
 test('question blocks completion; answer is correlated and duplicate/stale answers are rejected', async () => {
   const t = setup();
   try {
-    const r = await t.manager.launch({ task: 'SCENARIO_QUESTION', ownership: 'src/a', context: 'none', loadout: t.loadout });
+    const r = await t.manager.launch({ task: 'SCENARIO_QUESTION', access: "full", context: 'none', loadout: t.loadout });
     await until(() => r.state === 'waiting');
     await sleep(50); assert.equal(r.stopped, false); assert.equal(r.questions[0].id, 'q-1');
     await assert.rejects(t.manager.message(r.id, 'not an answer'), /question ID/);
@@ -50,10 +65,10 @@ test('question blocks completion; answer is correlated and duplicate/stale answe
 test('supplemental messages are queued, not reported as execution; cancel stops waiting and running children', async () => {
   const t = setup();
   try {
-    const r = await t.manager.launch({ task: 'SCENARIO_HOLD', ownership: 'a', context: 'none', loadout: t.loadout });
+    const r = await t.manager.launch({ task: 'SCENARIO_HOLD', access: "full", context: 'none', loadout: t.loadout });
     await t.manager.message(r.id, 'new instruction');
     assert.ok(r.log.some(l => l.includes('not yet proven executed')));
-    const q = await t.manager.launch({ task: 'SCENARIO_QUESTION', ownership: 'b', context: 'none', loadout: t.loadout });
+    const q = await t.manager.launch({ task: 'SCENARIO_QUESTION', access: "full", context: 'none', loadout: t.loadout });
     await until(() => q.state === 'waiting');
     await t.manager.cancel(q.id); assert.equal(q.state, 'cancelled'); assert.equal(q.stopped, true);
   } finally { await t.clean(); }
@@ -62,7 +77,7 @@ test('provider error and unexpected exit become failed, not successful completio
   const t = setup();
   try {
     for (const scenario of ['SCENARIO_ERROR', 'SCENARIO_DIE']) {
-      const r = await t.manager.launch({ task: scenario, ownership: scenario, context: 'none', loadout: t.loadout });
+      const r = await t.manager.launch({ task: scenario, access: "full", context: 'none', loadout: t.loadout });
       await until(() => r.state === 'failed' && r.activity === 'failed');
       assert.equal(r.stopped, scenario !== 'SCENARIO_DIE'); assert.ok(r.error);
     }
@@ -72,7 +87,7 @@ test('completed tasks persist and continue; concurrent continuations exclude a s
   const t = setup();
   let restored: TaskManager | undefined;
   try {
-    const r = await t.manager.launch({ task: 'initial', ownership: 'a', context: 'none', loadout: t.loadout });
+    const r = await t.manager.launch({ task: 'initial', access: "full", context: 'none', loadout: t.loadout });
     await until(() => r.stopped); await t.manager.shutdown();
     restored = t.create();
     const first = restored.continue(r.id, 'SCENARIO_HOLD');
@@ -86,7 +101,7 @@ test('completed tasks persist and continue; concurrent continuations exclude a s
 test('stale live records and lockfiles never auto-resume orphan writers', async () => {
   const t = setup();
   try {
-    const r = await t.manager.launch({ task: 'initial', ownership: 'a', context: 'none', loadout: t.loadout });
+    const r = await t.manager.launch({ task: 'initial', access: "full", context: 'none', loadout: t.loadout });
     await until(() => r.stopped);
     r.state = 'running'; r.stopped = false; t.manager.store.save(r);
     const loaded = t.manager.store.load()[0];
@@ -111,7 +126,7 @@ test('inherited loadouts reject legacy snapshots and nested tools; launch uses e
 test('stale settled events cannot close a task while a supplementary instruction is running', async () => {
   const t = setup();
   try {
-    const r = await t.manager.launch({ task: 'SCENARIO_HOLD', ownership: 'a', context: 'none', loadout: t.loadout });
+    const r = await t.manager.launch({ task: 'SCENARIO_HOLD', access: "full", context: 'none', loadout: t.loadout });
     await t.manager.message(r.id, 'finish this supplementary work');
     await sleep(30);
     assert.equal(r.stopped, false);
@@ -125,7 +140,7 @@ test('stale settled events cannot close a task while a supplementary instruction
 test('failed supplementary prompt does not strand a running writer', async () => {
   const t = setup();
   try {
-    const r = await t.manager.launch({ task: 'SCENARIO_HOLD', ownership: 'a', context: 'none', loadout: t.loadout });
+    const r = await t.manager.launch({ task: 'SCENARIO_HOLD', access: "full", context: 'none', loadout: t.loadout });
     await assert.rejects(t.manager.message(r.id, 'SCENARIO_REJECT_MESSAGE'), /rejected/);
     assert.equal(r.state, 'failed');
     assert.equal(r.stopped, true);
@@ -148,7 +163,7 @@ test('cancel rejects unconfirmed shutdown and retains stopped=false and exclusiv
     return rpc;
   } });
   try {
-    const record = await manager.launch({ task: 'SCENARIO_HOLD', ownership: 'a', context: 'none', loadout: t.loadout });
+    const record = await manager.launch({ task: 'SCENARIO_HOLD', access: "full", context: 'none', loadout: t.loadout });
     await assert.rejects(manager.cancel(record.id), /could not confirm shutdown.*injected stop confirmation failure/s);
     assert.equal(record.stopped, false);
     assert.equal(record.state, 'failed');
@@ -174,7 +189,7 @@ test('toolUse requires successful termination evidence for every call in the fin
     const assistant = (ids: string[]) => emit({ type: 'message_end', message: { role: 'assistant', stopReason: 'toolUse', content: ids.map(id => ({ type: 'toolCall', id, name: 'final' })) } });
     const ended = (id: string, terminate = true, isError = false) => emit({ type: 'tool_execution_end', toolCallId: id, toolName: 'final', result: { terminate, content: [] }, isError });
     try {
-      const record = await manager.launch({ task: scenario, ownership: 'a', context: 'none', loadout: t.loadout });
+      const record = await manager.launch({ task: scenario, access: "full", context: 'none', loadout: t.loadout });
       assistant(['one']);
       if (scenario === 'mixed') { assistant(['one', 'two']); ended('one'); ended('two', false); }
       else if (scenario !== 'missing') ended('one', true, scenario === 'error');
@@ -203,7 +218,7 @@ test('accepted unstarted reconciliation preserves queued work and rechecks lifec
     rpc.stop = async () => {};
     const manager = new TaskManager(new TaskStore(t.dir), { command: 'unused', createRpc: () => rpc });
     try {
-      const record = await manager.launch({ task: 'queued', ownership: 'a', context: 'none', loadout: t.loadout });
+      const record = await manager.launch({ task: 'queued', access: "full", context: 'none', loadout: t.loadout });
       await sleep(10);
       assert.equal(record.stopped, false);
       pending = 0;
@@ -227,7 +242,7 @@ test('late startup rejection cannot release an unconfirmed stopped writer lock',
   rpc.stop = async () => { throw new Error('stop unconfirmed'); };
   const manager = new TaskManager(new TaskStore(t.dir), { command: 'unused', createRpc: () => rpc });
   try {
-    const launch = manager.launch({ task: 'starting', ownership: 'a', context: 'none', loadout: t.loadout });
+    const launch = manager.launch({ task: 'starting', access: "full", context: 'none', loadout: t.loadout });
     const record = [...manager.records.values()][0];
     rpc.emit('fault', new Error('startup fault'));
     await until(() => record.activity === 'failed');

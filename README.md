@@ -7,18 +7,18 @@ This is the **4.0.0 breaking redesign** of the earlier tmux implementation. Targ
 ## Model of operation
 
 - One task → one child process → one persistent session.
-- The parent assigns file/module ownership. Reads and writes can run in parallel; workers must preserve each other's changes and ask before changing shared interfaces or working outside their scope.
-- Ownership is a cooperation agreement, **not a filesystem sandbox or lock**. Shared ports, databases, build outputs and edits can still conflict. The parent validates the combined result.
+- Each task requires `access: "read-only" | "full"`. Scope and coordination instructions belong in the task text, not an `ownership` field.
+- Access filters tools; it is **not a filesystem sandbox or lock**. Shared ports, databases, build outputs and edits can still conflict. The parent validates the combined result.
 - Children do not receive delegation tools. Only the parent launches subagents.
-- No workflow engine, worktrees, auto-merge, task retries, CLI backends other than Pi, or background daemon.
+- Optional persistent JSON DAG workflows reuse the same children. No worktrees, auto-merge, automatic retries, loops, condition-expression language, alternative CLI backends, or background daemon.
 
 ## Three context modes
 
-Context is the only child classification. There are no role definitions, profiles, or agent discovery:
+Context controls information inheritance independently of tool access. There are no role definitions, profiles, or agent discovery:
 
 | Mode | Inherited parent conversation |
 | --- | --- |
-| `none` | None. Task, ownership and cooperation guidance only. |
+| `none` | None. Task, access and cooperation guidance only (workflow steps also receive direct dependency results). |
 | `partial` (default) | Explicit `contextText` selected/written by the parent. Required; use `none` for an independent task. |
 | `full` | Frozen snapshot of the parent's active conversation branch at dispatch, respecting compaction summaries and retained messages. Includes the current assistant tool-calling message, not abandoned branches or later sibling results. |
 
@@ -26,14 +26,17 @@ Context is the only child classification. There are no role definitions, profile
 
 ## Runtime inheritance
 
-Every new child receives a frozen snapshot of the parent's **active nondelegation tools** and **all loaded skills**, plus the reserved blocking `ask_question` bridge. No profile or ambient-config tool/skill discovery is used:
+Every new child receives a frozen snapshot of the parent's **active nondelegation tools**, restricted by access, and **all loaded skills**, plus the reserved blocking `ask_question` bridge. No profile or ambient-config tool/skill discovery is used:
+
+- `full` preserves the parent's active nondelegation tool capabilities; it does not grant extra OS permissions.
+- `read-only` keeps only verified builtin `read`, `grep`, `find`, `ls` tools already active in the parent, plus `ask_question`. It excludes bash, edits, writes, all extension tools and builtin overrides, and does not load inherited tool-provider extensions. Explicit provider-only entrypoints are loaded separately and do not grant tool access. This is tool filtering, not OS isolation; builtins, skills and host configuration must still be trusted.
 
 - Tool names, JSON schemas, descriptions, guidelines and canonical source paths come from Pi's live `getActiveTools()` / `getAllTools()` APIs at launch. Inactive tools are not granted; an empty parent tool set grants only `ask_question`.
 - Skills come from the actual `before_agent_start.systemPromptOptions.skills` inventory, including package/CLI/extension-contributed skills and `disable-model-invocation` skills. Hidden skills retain their explicit-only behavior. Children load those exact skill files with `--skill`, not a fresh directory scan.
 - Builtins are reconstructed by Pi. File-backed extension tools (including builtin overrides and tools registered at startup) reload from their canonical runtime provider files. Child preflight compares each tool's schema/metadata and canonical builtin/extension provenance, plus the complete skill inventory/metadata, **before sending the task to a model**. Builtin substitution, missing tools/skills, changed metadata and extra contributed skills fail explicitly. Tool-call guards also check for later tool replacement.
 - The model defaults to the parent's current `provider/model` ID and thinking level. `model` explicitly overrides that ID; thinking is clamped by Pi to the selected model. The selected model must be available in the child; it never silently falls back to another model.
 
-**Reconstruction boundary:** Pi exposes tool metadata, not executable closures. Extension memory, interactive setup, runtime flags, parent-only hooks, in-memory authentication/provider registrations and SDK tool implementations are not copied. SDK/inline tools, virtual/missing skill files, providers that fail to reload, and dynamically configured tools that cannot recreate matching definitions are refused rather than silently dropped. File-backed providers must support fresh RPC startup; they may fail if they require interactive setup or other extensions not backing an inherited active tool. Provider-only extensions are not automatically inherited; use a model available through the child's config or inherited tool providers. Authentication comes from environment/config, not parent-only in-memory credentials.
+**Reconstruction boundary:** Pi exposes tool metadata, not executable closures. Extension memory, interactive setup, runtime flags, parent-only hooks, in-memory authentication/provider registrations and SDK tool implementations are not copied. SDK/inline tools, virtual/missing skill files, providers that fail to reload, and dynamically configured tools that cannot recreate matching definitions are refused rather than silently dropped. File-backed providers must support fresh RPC startup; they may fail if they require interactive setup or other extensions not backing an inherited active tool. Provider extensions may opt in via the synchronous `rpc-subagents:provider-source:v1` event (`{ provider, register(absoluteEntrypointPath) }`). Advertised provider-only entrypoints are frozen in the loadout, revalidated on launch/continuation, and retained under read-only access. They must be trusted and must not restore another model, enable tools or install account-failover/session hooks. Unadvertised provider-only extensions are not inherited. `pi-multi-account` supplies a dedicated Antigravity entrypoint for this contract; it registers only the requested account, without rotation or model restore. Authentication comes from environment/config, not parent-only in-memory credentials.
 
 Automatic extension, skill, prompt-template and context-file (`AGENTS.md`/`CLAUDE.md`) discovery is disabled in children. Required project instructions belong in task/context. Pi's normal system-prompt configuration may still apply, with child cooperation guidance appended; the parent system prompt is not copied. Files backing skills/extensions are not content-pinned: continuation revalidates inventories and metadata, but implementation/body changes with unchanged metadata can change behavior.
 
@@ -47,13 +50,13 @@ Automatic extension, skill, prompt-template and context-file (`AGENTS.md`/`CLAUD
 {
   "name": "auth",
   "task": "Fix expired-token handling and add tests",
-  "ownership": "src/auth/ and test/auth/; coordinate before changing shared types",
+  "access": "full",
   "context": "partial",
   "contextText": "The API returns 401 for expired tokens. Preserve the existing refresh contract."
 }
 ```
 
-Required: `task`, `ownership`. Optional: `name`, `model`, `cwd`, `context`, `contextText`. `contextText` is only accepted in `partial` mode. Names default to the context mode (`none`, `partial`, `full`); all names are deduplicated.
+Required: `task`, `access`. Optional: `name`, `model`, `cwd`, `context`, `contextText`. `contextText` is only accepted in `partial` mode. Names default to the context mode (`none`, `partial`, `full`); all names are deduplicated.
 
 The call waits for startup/preflight and RPC acceptance, **not task completion**. Results and questions arrive automatically as parent messages. After launching, the parent can do independent work or end its turn. Do not poll to wait for completion.
 
@@ -64,6 +67,7 @@ For an independent review use `context: "none"`; for a continuation of a complex
 ```json
 { "action": "list" }
 { "action": "inspect", "id": "auth" }
+{ "action": "history", "id": "auth", "limit": 20 }
 { "action": "message", "id": "auth", "message": "Also cover an empty refresh token" }
 { "action": "answer", "id": "auth", "questionId": "<ID from question>", "message": "Keep the existing API shape" }
 { "action": "cancel", "id": "auth" }
@@ -71,6 +75,42 @@ For an independent review use `context: "none"`; for a continuation of a complex
 ```
 
 `id` accepts the stable UUID or unique task name. `message` only targets a running task; use `continue` explicitly for a finished task. RPC acceptance means accepted/queued, not proven executed. When a question is pending, use `answer` with its ID instead of an ordinary message. Duplicate and stale answers are rejected.
+
+`history` returns bounded tool calls/results from the retained session (default 20 entries, maximum 100). It is evidence of operations, **not an exact filesystem attribution audit**. Inspect actual diffs and verification too. A stopped standalone task can be continued with `access: "read-only"` to request explanations; new tasks retain their original access when omitted. Legacy records without `access` remain readable but require an explicit choice before continuation. Workflow steps use `workflow_control retry` rather than direct continuation.
+
+### Workflows: `workflow_run` / `workflow_control`
+
+```json
+{
+  "name": "auth-fix",
+  "context": "partial",
+  "contextText": "Fix expired-token handling without changing the refresh API.",
+  "maxParallel": 3,
+  "steps": [
+    { "id": "investigate", "task": "Locate the bug and explain evidence", "access": "read-only", "dependsOn": [] },
+    { "id": "fix", "task": "Implement the narrow fix and tests", "access": "full", "dependsOn": ["investigate"] },
+    { "id": "validate", "task": "Run focused tests and report results", "access": "full", "dependsOn": ["fix"] },
+    { "id": "review", "task": "Read the changes and validation report; identify remaining risks", "access": "read-only", "dependsOn": ["validate"] }
+  ]
+}
+```
+
+Definitions contain 1–64 steps, unique IDs, existing dependencies and no cycles. `maxParallel` is 1–16 (default 3). Context defaults to `partial`, requiring `contextText`; `full` freezes the current branch **once per workflow**, not once per step. Each step also receives bounded direct-upstream reports and their session paths. Reports are claims, not acceptance proof. Running tests usually requires `full` because `read-only` excludes bash.
+
+Read-only steps may overlap; a full step runs alone **within its own workflow**. Other workflows, standalone subagents and external writers are not locked. Failure pauses new dispatch; active siblings finish normally. Questions use the existing child answer tool.
+
+```json
+{ "action": "inspect", "id": "auth-fix" }
+{ "action": "pause", "id": "auth-fix" }
+{ "action": "update", "id": "auth-fix", "steps": [{ "id": "extra-review", "task": "Check compatibility", "access": "read-only", "dependsOn": ["review"] }] }
+{ "action": "retry", "id": "auth-fix", "stepId": "fix", "message": "Address the reported edge case", "access": "full" }
+{ "action": "resume", "id": "auth-fix" }
+{ "action": "cancel", "id": "auth-fix" }
+```
+
+These are independent control examples, not a sequence. Pause stops future dispatch, not active children. Updates require a paused workflow and only upsert unstarted steps. Retry requires an explicit instruction, a paused workflow, no active steps in it, confirmed cleanup, and no already-started descendants. It continues the same child session (or requeues if no child was created), and never automatically resumes scheduling. Completed workflows can be paused for a terminal-step follow-up; earlier steps with started descendants cannot be retried because that would invalidate their inputs. Use retained history for investigating those steps. No automatic blame attribution or rollback is provided.
+
+Workflow JSON lives under the task directory's `workflows/` folder. Parent shutdown pauses scheduling before stopping children. Restart never auto-runs a workflow; inspect and explicitly resume. Unconfirmed orphan shutdown blocks scheduling and retry, requiring manual process/lock investigation. `/workflows [ID or name]` shows a snapshot; control changes use the tools.
 
 ### Child questions
 
@@ -82,7 +122,7 @@ The main session has a compact live widget (up to five rows), showing task name/
 
 Use **`/subagents`** (or `/subagents <task ID>`) to select a task, then:
 
-- **Details**: scrollable snapshot of task/ownership, latest assistant text, questions and recent tool activity. This is a snapshot, not a streaming terminal; reopen to refresh. Editing the displayed copy changes nothing.
+- **Details**: scrollable snapshot of task/access, latest assistant text, questions and recent tool activity. This is a snapshot, not a streaming terminal; reopen to refresh. Editing the displayed copy changes nothing.
 - **Message**: send supplementary instructions.
 - **Answer question**: select a pending question and reply.
 - **Cancel**: confirm and stop the task.
@@ -124,7 +164,7 @@ To try the extension without changing your global installation, from the project
 pi --no-extensions -e /absolute/path/to/pi-interactive-subagents/pi-extension/subagents/index.ts
 ```
 
-This intentionally disables the currently installed subagent extension for this trial process. Do not load both packages together: they register conflicting tool names. Start with a `none` investigation task, explicit read-only ownership and a model available to the child. Remember: read-only ownership is an instruction, not a tool restriction; restrict the parent active tool set if needed. Trial tasks use real model quota. The extension requires a persistent parent session (not `--no-session`). Nothing in the source migration changes your current global settings or enables this package automatically.
+This intentionally disables the currently installed subagent extension for this trial process. Do not load both packages together: they register conflicting tool names. Start with a `none` investigation task, `access: "read-only"` and a model available to the child. Read-only filters tools but is not a filesystem sandbox. Trial tasks use real model quota. The extension requires a persistent parent session (not `--no-session`). Nothing in the source migration changes your current global settings or enables this package automatically.
 
 ## Source map
 

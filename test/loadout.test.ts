@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync, symlinkSync, unlinkSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Skill } from "@earendil-works/pi-coding-agent";
-import { CHILD_EXTENSION, isDelegationTool, resolveLoadout, verifyTools, verifySkills, validateLoadout } from "../pi-extension/subagents/loadout.ts";
+import { CHILD_EXTENSION, isDelegationTool, resolveLoadout, verifyTools, verifySkills, validateLoadout, applyAccess } from "../pi-extension/subagents/loadout.ts";
 import { readInfo } from "./fixtures/loadout.ts";
 
 function setup() {
@@ -30,6 +30,43 @@ test("loadout freezes actual active tools and all skills, not names guessed from
     t.skill.description = "later change"; t.tool.description = "later tool change";
     assert.equal(l.skills[0].description, "Hidden skill");
     assert.equal(l.toolMetadata[0].description, "Search custom data");
+  } finally { t.clean(); }
+});
+test("provider-only sources are frozen independently of tool access and validated", () => {
+  const t = setup();
+  try {
+    const api = { ...t.api, events: { emit(channel: string, data: unknown) {
+      assert.equal(channel, 'rpc-subagents:provider-source:v1');
+      const request = data as { provider: string; register: (path: string) => void };
+      assert.equal(request.provider, 'fake'); request.register(t.source);
+    }, on() { return () => {}; } } };
+    const l = resolveLoadout(api, [], t.dir, 'fake/test', 'low', t.dir);
+    assert.deepEqual(l.providerExtensions, [t.source]);
+    const ro = applyAccess(l, 'read-only');
+    assert.deepEqual(ro.providerExtensions, [t.source]);
+    assert.deepEqual(ro.tools, ['read', 'ask_question']);
+    assert.deepEqual(ro.extensions, []);
+    assert.throws(() => validateLoadout({ ...ro, providerExtensions: ['relative.ts'] }), /absolute/);
+    assert.throws(() => validateLoadout({ ...ro, providerExtensions: [t.source, t.source] }), /Invalid provider/);
+    unlinkSync(t.source);
+    assert.throws(() => validateLoadout(ro), /missing source/);
+  } finally { t.clean(); }
+});
+test("read-only drops custom tools and extension overrides; full preserves inheritance", () => {
+  const t = setup();
+  try {
+    const l = resolveLoadout(t.api, [], t.dir, "fake/test", "high", t.dir);
+    assert.deepEqual(applyAccess(l, "full"), l);
+    const restricted = applyAccess(l, "read-only");
+    assert.deepEqual(restricted.tools, ["read", "ask_question"]);
+    assert.deepEqual(restricted.extensions, []);
+    assert.ok(l.tools.includes("custom_search"));
+    t.tool.name = "read";
+    t.api.getActiveTools = () => ["read"];
+    t.api.getAllTools = () => [t.tool];
+    const overridden = resolveLoadout(t.api, [], t.dir, "fake/test", "high", t.dir);
+    assert.deepEqual(applyAccess(overridden, "read-only").tools, ["ask_question"]);
+    assert.ok(isDelegationTool("workflow_run")); assert.ok(isDelegationTool("workflow_control"));
   } finally { t.clean(); }
 });
 test("empty parent active set remains empty except ask_question; delegation names are excluded", () => {

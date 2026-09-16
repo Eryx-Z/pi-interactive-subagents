@@ -43,10 +43,10 @@ test("none/partial seed empty sessions; full seeds reference messages and closes
     }
     assert.equal(parent.length, 2);
     assert.equal(closePendingCalls(parent).at(-1)?.role, 'toolResult');
-    assert.match(taskPrompt('task', 'src/a', 'partial', 'selected background'), /selected background/);
-    assert.throws(() => taskPrompt('task', 'src/a', 'partial'), /requires/);
-    assert.throws(() => taskPrompt('task', 'src/a', 'none', 'accidental history'), /only supported/);
-    assert.doesNotMatch(taskPrompt('task', 'src/a', 'none'), /selected background/);
+    assert.match(taskPrompt('task', 'full', 'partial', 'selected background'), /selected background/);
+    assert.throws(() => taskPrompt('task', 'full', 'partial'), /requires/);
+    assert.throws(() => taskPrompt('task', 'full', 'none', 'accidental history'), /only supported/);
+    assert.doesNotMatch(taskPrompt('task', 'full', 'none'), /selected background/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 test("closePendingCalls closes multiple pending calls and preserves completed results", () => {
@@ -76,27 +76,28 @@ test("closePendingCalls closes multiple pending calls and preserves completed re
   assert.equal(closed[4].toolCallId, 'call-3');
   assert.equal(closed[4].isError, true);
 });
-test("taskPrompt injects cooperative guidelines, context mode, and ownership for all modes", () => {
-  const nonePrompt = taskPrompt('build feature', 'src/feature/*', 'none');
+test("taskPrompt injects cooperative guidelines, context mode, access and handoff for all modes", () => {
+  const nonePrompt = taskPrompt('build feature', 'full', 'none');
   assert.match(nonePrompt, /Context mode: none/);
-  assert.match(nonePrompt, /Ownership: src\/feature\/\*/);
+  assert.match(nonePrompt, /Access: full/);
   assert.match(nonePrompt, /Assigned task:\nbuild feature/);
-  assert.match(nonePrompt, /cooperation agreement/);
+  assert.match(nonePrompt, /not a filesystem sandbox/);
+  assert.match(nonePrompt, /reasons and assumptions/);
   assert.doesNotMatch(nonePrompt, /Selected parent context/);
 
-  const fullPrompt = taskPrompt('fix bug', 'src/bug.ts', 'full');
+  const fullPrompt = taskPrompt('fix bug', 'read-only', 'full');
   assert.match(fullPrompt, /Context mode: full/);
-  assert.match(fullPrompt, /Ownership: src\/bug\.ts/);
+  assert.match(fullPrompt, /Access: read-only/);
   assert.match(fullPrompt, /Assigned task:\nfix bug/);
   assert.doesNotMatch(fullPrompt, /Selected parent context/);
 
-  const partialPrompt = taskPrompt('test module', 'test/*', 'partial', 'use auth token in headers');
+  const partialPrompt = taskPrompt('test module', 'full', 'partial', 'use auth token in headers');
   assert.match(partialPrompt, /Context mode: partial/);
   assert.match(partialPrompt, /Selected parent context:\nuse auth token in headers/);
   assert.match(partialPrompt, /Assigned task:\ntest module/);
 
-  assert.throws(() => taskPrompt('task', 'src/*', 'full', 'accidental text'), /contextText is only supported in partial mode/);
-  assert.throws(() => taskPrompt('task', 'src/*', 'invalid' as any), /Invalid context mode/);
+  assert.throws(() => taskPrompt('task', 'full', 'full', 'accidental text'), /contextText is only supported in partial mode/);
+  assert.throws(() => taskPrompt('task', 'full', 'invalid' as any), /Invalid context mode/);
 });
 
 test("closePendingCalls preserves error/aborted assistants without orphan provider results", async () => {

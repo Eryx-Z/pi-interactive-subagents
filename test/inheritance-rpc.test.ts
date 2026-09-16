@@ -42,7 +42,7 @@ test("real parent dispatch reloads tools and file/directory symlink skills for e
     const recordDir = join(dir, "rpc-subagents", state.sessionId);
     const records = () => existsSync(recordDir) ? readdirSync(recordDir).filter(f => /^[a-f0-9-]{36}\.json$/.test(f)).map(f => JSON.parse(readFileSync(join(recordDir, f), "utf8")) as TaskRecord) : [];
     for (const context of ["none", "partial", "full"] as const) {
-      await rpc.request("prompt", { streamingBehavior: "followUp", message: `DISPATCH ${JSON.stringify({ task: "EXERCISE", ownership: "read-only", ...(context === "partial" ? {} : { context }),
+      await rpc.request("prompt", { streamingBehavior: "followUp", message: `DISPATCH ${JSON.stringify({ task: "EXERCISE", access: "full", ...(context === "partial" ? {} : { context }),
         ...(context === "partial" ? { contextText: "selected explicit background", model: "inherited-fixture/override" } : {}) })}` });
       const record = await until(() => records().find(r => r.context === context && r.stopped));
       assert.equal(record.state, "completed", record.error);
@@ -74,7 +74,7 @@ test("real parent dispatch reloads tools and file/directory symlink skills for e
       if (context === "partial") assert.match(JSON.stringify(users), /Selected parent context:\\nselected explicit background/);
       if (context === "full") assert.match(JSON.stringify(entries), /frozen reference snapshot/);
     }
-    await rpc.request("prompt", { streamingBehavior: "followUp", message: 'DISPATCH {"task":"ASK","ownership":"read-only","context":"none","name":"question"}' });
+    await rpc.request("prompt", { streamingBehavior: "followUp", message: 'DISPATCH {"task":"ASK","access":"full","context":"none","name":"question"}' });
     const waiting = await until(() => records().find(r => r.name === "question" && r.state === "waiting"));
     assert.equal(waiting.questions.length, 1);
     assert.equal(waiting.stopped, false);

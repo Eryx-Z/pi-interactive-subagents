@@ -1,16 +1,17 @@
 import { buildSessionContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { atomicWrite } from "./store.ts";
+import { accessMode, type AccessMode } from "./loadout.ts";
 
 export type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
 export type ContextMode = "none" | "partial" | "full";
 export const COOPERATION = `You are a delegated child, not the parent orchestrator. Historical conversation is reference-only.
 Only execute the assigned task. Do not delegate to other agents or launch agent CLIs.
-Other agents share this working directory and may read and write concurrently. Modify only your assigned ownership scope.
-Do not overwrite or revert others' changes. Ask the parent before changing shared interfaces or files outside your scope.
-Ownership is a cooperation agreement, not a filesystem sandbox.
+Other agents share this working directory and may read and write concurrently.
+Do not overwrite or revert others' changes. Ask the parent before changing shared interfaces or expanding the assigned task.
+Respect the selected access mode. Tool filtering is not a filesystem sandbox.
 Use ask_question for decisions you cannot make; the tool blocks until the correlated answer arrives.
-Finish with: completion status (complete/partial/blocked), changes, validation, and remaining issues. Stopping is not proof of correctness.`;
+Finish with a handoff report: completion status (complete/partial/blocked), files changed, reasons and assumptions, validation commands/results, remaining issues and possible conflicts. Stopping is not proof of correctness.`;
 
 /** Called at tool preflight: the session is synchronized through the current assistant message. */
 export function snapshotContext(sm: ExtensionContext["sessionManager"]): AgentMessage[] {
@@ -50,9 +51,10 @@ export function seedSession(path: string, cwd: string, mode: ContextMode, snapsh
   }
   atomicWrite(path, lines.map(l => JSON.stringify(l)).join("\n") + "\n");
 }
-export function taskPrompt(task: string, ownership: string, context: ContextMode, contextText?: string): string {
+export function taskPrompt(task: string, access: AccessMode, context: ContextMode, contextText?: string): string {
+  accessMode(access);
   if (!["none", "partial", "full"].includes(context)) throw new Error("Invalid context mode");
   if (context !== "partial" && contextText) throw new Error("contextText is only supported in partial mode");
   if (context === "partial" && !contextText?.trim()) throw new Error("partial context requires explicit contextText (use none for an independent task)");
-  return `${COOPERATION}\n\nContext mode: ${context}\nOwnership: ${ownership}\n\n${context === "partial" ? `Selected parent context:\n${contextText}\n\n` : ""}Assigned task:\n${task}`;
+  return `${COOPERATION}\n\nContext mode: ${context}\nAccess: ${access}\n\n${context === "partial" ? `Selected parent context:\n${contextText}\n\n` : ""}Assigned task:\n${task}`;
 }

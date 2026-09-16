@@ -14,7 +14,7 @@ export function widget(manager: TaskManager, ctx: ExtensionContext): void {
   ctx.ui.setWidget("rpc-subagents", sorted.length ? ["Subagents — /subagents to inspect, message, answer, cancel or continue", ...sorted.slice(0, 5).map(r => clean(taskSummary(r)).replace(/\s+/g, " ").slice(0, 150)), ...(sorted.length > 5 ? [`+${sorted.length - 5} saved tasks`] : [])] : undefined);
 }
 export function detail(r: TaskRecord): string {
-  return clean(`${taskSummary(r)}\nContext: ${r.context} · Run: ${r.run}\nOwnership: ${r.ownership}\nCwd: ${r.loadout.cwd}\nSession: ${r.sessionFile}\nTask: ${r.task}\n${r.error ?? ""}\n\nQuestions:\n${r.questions.map(q => `${q.id}: ${q.title}${q.responseSent ? " (answer sent)" : ""}`).join("\n")}\n\nLatest assistant text (bounded):\n${r.output}\n\nRecent activity (bounded):\n${r.log.join("\n")}`);
+  return clean(`${taskSummary(r)}\nContext: ${r.context} · Run: ${r.run}\nAccess: ${r.access ?? "legacy — choose access before continuation"}${r.workflow ? `\nWorkflow: ${r.workflow.id}, step ${r.workflow.stepId}` : ""}\nCwd: ${r.loadout.cwd}\nSession: ${r.sessionFile}\nTask: ${r.task}\n${r.error ?? ""}\n\nQuestions:\n${r.questions.map(q => `${q.id}: ${q.title}${q.responseSent ? " (answer sent)" : ""}`).join("\n")}\n\nLatest assistant text (bounded):\n${r.output}\n\nRecent activity (bounded):\n${r.log.join("\n")}`);
 }
 export async function taskMenu(manager: TaskManager, ctx: ExtensionContext, taskId?: string): Promise<void> {
   if (!ctx.hasUI) throw new Error("Use subagent_control in headless mode");
@@ -31,7 +31,11 @@ export async function taskMenu(manager: TaskManager, ctx: ExtensionContext, task
     const message = await ctx.ui.editor(`${action}: ${clean(record.name)}`, "");
     if (!message?.trim()) return;
     if (action === "Message") { await manager.message(record.id, message); ctx.ui.notify("Instruction accepted/queued, not yet proven executed", "info"); }
-    else { await manager.continue(record.id, message); ctx.ui.notify("Continuation accepted", "info"); }
+    else {
+      const access = await ctx.ui.select("Continuation access", ["read-only", "full"]);
+      if (access !== "read-only" && access !== "full") return;
+      await manager.continue(record.id, message, access); ctx.ui.notify("Continuation accepted", "info");
+    }
   } else if (action === "Answer question") {
     const questions = record.questions.filter(q => !q.responseSent);
     if (!questions.length) { ctx.ui.notify("No unanswered questions", "info"); return; }

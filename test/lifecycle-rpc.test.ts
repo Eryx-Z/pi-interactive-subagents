@@ -42,7 +42,7 @@ function setup(timeoutMs = 15000) {
 test("real Pi aborts builtin bash before delayed extension shutdown and never writes its marker", { timeout: 30000, skip: process.platform === "win32" }, async () => {
   const t = setup();
   try {
-    const record = await t.manager.launch({ task: "BASH", ownership: "started, marker", context: "none", loadout: t.loadout });
+    const record = await t.manager.launch({ task: "BASH", access: "full", context: "none", loadout: t.loadout });
     await until(() => existsSync(join(t.dir, "started")));
     await t.manager.cancel(record.id);
     assert.equal(record.stopped, true, record.error);
@@ -57,7 +57,7 @@ test("real Pi aborts builtin bash before delayed extension shutdown and never wr
 test("real Pi handled input fails explicitly and cleans up without a model run or resubmission", { timeout: 30000 }, async () => {
   const t = setup();
   try {
-    const record = await t.manager.launch({ task: "HANDLED", ownership: "read-only", context: "none", loadout: t.loadout });
+    const record = await t.manager.launch({ task: "HANDLED", access: "full", context: "none", loadout: t.loadout });
     await until(() => record.stopped);
     assert.equal(record.state, "failed");
     assert.match(record.error!, /accepted.*no agent run started/);
@@ -70,9 +70,10 @@ test("real Pi handled input fails explicitly and cleans up without a model run o
 test("real Pi terminating tool completes exactly once without another assistant turn", { timeout: 30000 }, async () => {
   const t = setup();
   try {
-    const record = await t.manager.launch({ task: "TERMINATE", ownership: "read-only", context: "none", loadout: t.loadout });
+    const record = await t.manager.launch({ task: "TERMINATE", access: "full", context: "none", loadout: t.loadout });
     await until(() => record.stopped);
     assert.equal(record.state, "completed", record.error);
+    assert.equal(record.output, "Finished through tool");
     assert.deepEqual(t.results, ["completed"]);
     const assistants = readFileSync(record.sessionFile, "utf8").trim().split("\n").map(s => JSON.parse(s)).filter(e => e.message?.role === "assistant");
     assert.equal(assistants.length, 1);
@@ -84,7 +85,7 @@ test("real Pi terminating tool completes exactly once without another assistant 
 for (const { hook, timeout } of [{ hook: "INPUT", timeout: false }, { hook: "BEFORE", timeout: false }, { hook: "BEFORE", timeout: true }]) test(`real Pi ${timeout ? "timeout" : "cancellation"} during gated ${hook} preflight never confirms cleanup from an idle abort`, { timeout: 30000, skip: process.platform === "win32" }, async () => {
   const t = setup(timeout ? 3000 : 15000);
   try {
-    const launch = t.manager.launch({ task: `GATED_${hook}_BASH`, ownership: "fixture markers", context: "none", loadout: t.loadout })
+    const launch = t.manager.launch({ task: `GATED_${hook}_BASH`, access: "full", context: "none", loadout: t.loadout })
       .then(() => undefined, error => error as Error);
     await until(() => existsSync(join(t.dir, "preflight-entered")));
     assert.equal((await t.rpc.request("get_state")).isStreaming, false, "Pi reports idle while awaiting prompt hooks");
@@ -118,7 +119,7 @@ for (const { hook, timeout } of [{ hook: "INPUT", timeout: false }, { hook: "BEF
 test('real Pi late preflight receipt before shutdown allows abort confirmation without waiting for model completion', { timeout: 30000, skip: process.platform === 'win32' }, async () => {
   const t = setup();
   try {
-    const launch = t.manager.launch({ task: 'GATED_INPUT_BASH', ownership: 'fixture markers', context: 'none', loadout: t.loadout })
+    const launch = t.manager.launch({ task: 'GATED_INPUT_BASH', access: "full", context: 'none', loadout: t.loadout })
       .then(() => undefined, error => error as Error);
     await until(() => existsSync(join(t.dir, 'preflight-entered')));
     const record = [...t.manager.records.values()][0];
