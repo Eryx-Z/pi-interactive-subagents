@@ -72,6 +72,28 @@ test("stop escalates without EOF when abort cleanup cannot be confirmed", async 
   assert.equal(events.includes('eof'), false);
 });
 
+test("Pi 0.84 fallback confirms an empty queue after abort and rejects a nonempty one", async () => {
+  for (const pendingMessageCount of [0, 1]) {
+    const r = new RpcProcess({ command: process.execPath, cwd: process.cwd(), args: ['-e', `
+      let buffer = '';
+      const send = event => process.stdout.write(JSON.stringify(event) + '\\n');
+      process.stdin.on('data', data => {
+        buffer += data;
+        let n;
+        while ((n = buffer.indexOf('\\n')) >= 0) {
+          const e = JSON.parse(buffer.slice(0, n)); buffer = buffer.slice(n + 1);
+          if (e.type === 'clear_queue') send({type:'response', id:e.id, command:e.type, success:false, error:'Unknown command: clear_queue'});
+          else if (e.type === 'get_state') send({type:'response', id:e.id, command:e.type, success:true, data:{isStreaming:false, isCompacting:false, pendingMessageCount:${pendingMessageCount}}});
+          else send({type:'response', id:e.id, command:e.type, success:true});
+        }
+      });
+    `] }, 2000, 50);
+    await r.request('get_state');
+    if (pendingMessageCount === 0) await r.stop();
+    else await assert.rejects(r.stop(), /cannot confirm an empty queue/);
+  }
+});
+
 const preflightFixture = fileURLToPath(new URL('./fixtures/prompt-preflight-rpc.mjs', import.meta.url));
 function preflightRpc(timeout = 1000, grace = 500) {
   const rpc = new RpcProcess({ command: process.execPath, args: [preflightFixture], cwd: process.cwd() }, timeout, grace);

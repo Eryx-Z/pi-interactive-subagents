@@ -1,28 +1,42 @@
 {
   "name": "pi-interactive-subagents",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "Context-based shared-workspace subagents over Pi RPC, inheriting parent tools and skills",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "author": "Amos Blomqvist",
   "type": "module",
-  "engines": { "node": ">=22" },
-  "files": ["pi-extension/", "README.md", "LICENSE"],
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "pi-extension/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
-  "pi": { "extensions": ["./pi-extension/subagents/index.ts"] },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.85.1 <0.86.0",
-    "@earendil-works/pi-ai": ">=0.85.1 <0.86.0",
-    "@earendil-works/pi-tui": ">=0.85.1 <0.86.0"
+  "pi": {
+    "extensions": [
+      "./pi-extension/subagents/index.ts"
+    ]
   },
-  "dependencies": { "typebox": "1.1.38" },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.2 <0.86.0",
+    "@earendil-works/pi-ai": ">=0.84.2 <0.86.0",
+    "@earendil-works/pi-tui": ">=0.84.2 <0.86.0"
+  },
+  "dependencies": {
+    "typebox": "1.1.38"
+  },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.85.1",
-    "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-tui": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
     "@types/node": "^22.0.0",
     "tsx": "4.23.0",
     "typescript": "5.9.3"

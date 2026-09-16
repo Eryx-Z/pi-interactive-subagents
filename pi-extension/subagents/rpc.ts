@@ -140,8 +140,21 @@ export class RpcProcess extends EventEmitter {
     // receipts first, then abort while Pi still has its detached-bash signal cleanup.
     try {
       await this.waitForPromptPreflights();
-      await this.requestWithTimeout("clear_queue", {}, this.graceMs, false);
+      let legacyWithoutClearQueue = false;
+      try { await this.requestWithTimeout("clear_queue", {}, this.graceMs, false); }
+      catch (error) {
+        if (!(error instanceof Error) || !/Unknown command:\s*clear_queue\b/.test(error.message)) throw error;
+        legacyWithoutClearQueue = true;
+      }
       await this.requestWithTimeout("abort", {}, this.graceMs, false);
+      if (legacyWithoutClearQueue) {
+        // Pi 0.84 has Session.clearQueue(), but does not expose it over RPC. Abort,
+        // then conservatively prove that no queued work remains before allowing EOF.
+        const state = await this.requestWithTimeout("get_state", {}, this.graceMs, false);
+        if (state?.isStreaming !== false || state?.isCompacting || state?.pendingMessageCount) {
+          throw new Error("Pi 0.84 cannot confirm an empty queue after abort");
+        }
+      }
       cleanupConfirmed = true;
     } catch (error) { cleanupError = error; /* No EOF or confirmation when preflight/abort is uncertain. */ }
     if (cleanupConfirmed && !this.child.stdin.destroyed && this.child.stdin.writable) {
