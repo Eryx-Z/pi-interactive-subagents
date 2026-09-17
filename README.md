@@ -1,6 +1,6 @@
 # pi-interactive-subagents — context-based RPC
 
-Lightweight parallel subagents for Pi, without tmux. Each task runs in a background Pi RPC process with its own conversation. All tasks use the shared working directory unless an explicit `cwd` is supplied. The parent session displays progress, receives results and questions, and controls children.
+Lightweight parallel subagents for Pi, without tmux. Each task runs in a background Pi RPC process with its own conversation. Standalone tasks use the shared working directory unless an explicit `cwd` is supplied. Workflows can opt into isolated Git worktrees. The parent session displays progress, receives results and questions, and controls children.
 
 This is the **4.0.0 breaking redesign** of the earlier tmux implementation. Target: `@earendil-works/pi-coding-agent` **0.84.2–0.85.x**, Node **22+**. It uses `agent_settled`, current extension tool APIs, and blocking RPC UI input. Older `@mariozechner` Pi versions are not supported.
 
@@ -10,7 +10,7 @@ This is the **4.0.0 breaking redesign** of the earlier tmux implementation. Targ
 - Each task requires `access: "read-only" | "full"`. Scope and coordination instructions belong in the task text, not an `ownership` field.
 - Access filters tools; it is **not a filesystem sandbox or lock**. Shared ports, databases, build outputs and edits can still conflict. The parent validates the combined result.
 - Children do not receive delegation tools. Only the parent launches subagents.
-- Optional persistent JSON DAG workflows reuse the same children. No worktrees, auto-merge, automatic retries, loops, condition-expression language, alternative CLI backends, or background daemon.
+- Optional persistent JSON DAG workflows reuse the same children. Isolated mode supports parallel writable worktrees and validated integration into a separate result worktree. No automatic application to the user checkout, automatic retries, loops, condition-expression language, alternative CLI backends, or background daemon.
 
 ## Three context modes
 
@@ -58,6 +58,8 @@ Automatic extension, skill, prompt-template and context-file (`AGENTS.md`/`CLAUD
 
 Required: `task`, `access`. Optional: `name`, `model`, `cwd`, `context`, `contextText`. `contextText` is only accepted in `partial` mode. Names default to the context mode (`none`, `partial`, `full`); all names are deduplicated.
 
+Startup failures include the failing phase, target model, child agent directory, original error and a troubleshooting hint. Known credential, model/provider and loadout/extension errors are distinguished; unknown startup errors remain generic. Credential errors arriving after RPC acceptance also receive guidance. Classification is best-effort, not an authentication probe: preflight does not call the provider, and no automatic retry or account switch is added.
+
 The call waits for startup/preflight and RPC acceptance, **not task completion**. Results and questions arrive automatically as parent messages. After launching, the parent can do independent work or end its turn. Do not poll to wait for completion.
 
 For an independent review use `context: "none"`; for a continuation of a complex discussion use `context: "full"`. Tool and skill inheritance stays the same in every mode.
@@ -97,7 +99,21 @@ For an independent review use `context: "none"`; for a continuation of a complex
 
 Definitions contain 1–64 steps, unique IDs, existing dependencies and no cycles. `maxParallel` is 1–16 (default 3). Context defaults to `partial`, requiring `contextText`; `full` freezes the current branch **once per workflow**, not once per step. Each step also receives bounded direct-upstream reports and their session paths. Reports are claims, not acceptance proof. Running tests usually requires `full` because `read-only` excludes bash.
 
-Read-only steps may overlap; a full step runs alone **within its own workflow**. Other workflows, standalone subagents and external writers are not locked. Failure pauses new dispatch; active siblings finish normally. Questions use the existing child answer tool.
+Default `workspace: "shared"`: read-only steps may overlap; a full step runs alone **within its own workflow**. Other workflows, standalone subagents and external writers are not locked. Failure pauses new dispatch; active siblings finish normally. Questions use the existing child answer tool.
+
+#### Isolated writable workflows
+
+Add `"workspace": "isolated"` and an explicit `"validationCommand": "npm ci && npm test"` to `workflow_run`. This mode requires a **clean Git checkout**, including untracked files, an existing HEAD, no submodules, POSIX validation process groups, and workflow storage outside the repository. Initialization errors pause without launching children. Existing shared workflows remain compatible.
+
+- Every step, including readers, gets a detached worktree. Independent writers overlap up to `maxParallel` and the owner-wide task cap.
+- Before launching a dependent step, Git merges its direct dependencies' captured revisions into its own worktree. Reports alone are not used as code propagation. Diamond dependencies retain real Git ancestry.
+- After a child has confirmed shutdown, tracked changes, deletions and non-ignored untracked files are committed in its worktree. Ignored files, dependency installations and external resources are **not** copied between worktrees. Prepare those explicitly in task instructions/validation commands.
+- Final Git integration is serialized by the workflow owner into a separate result worktree. The explicit validation command runs there (in the original relative cwd), with a ten-minute deadline. Nonzero exit, dirty files, a changed HEAD, or conflicts pause completion. Logs are retained at `<result-worktree>.validation.log`. Validation success is only as meaningful as the supplied command.
+- Inspect shows the result directory and validated commit. Review its diff against the source base before manually applying it. The extension never stashes, resets, cleans, commits in, or automatically merges into the source checkout.
+- Merge conflicts remain intact. Resolve and commit them in the reported worktree; use `resume` for final-integration failures, or explicit step `retry` followed by `resume` for dependency-preparation failures. Failed steps continue in their original session/worktree. No automatic conflict solver or cleanup is run.
+- Worktrees and logs survive failure/cancellation/restart for investigation. Restart pauses; uncertain child or validation-process shutdown blocks reuse. Check the recorded PID/process group manually; the extension never kills an unverified recovered PID. Remove retained worktrees with `git worktree remove` only after confirming no children/validation processes remain.
+
+**Worktrees are not sandboxes.** Full agents and validation commands can still use absolute paths, alter shared Git metadata, access credentials/network, contend for ports/databases, or create escaped daemons. Containers, external resource namespaces, cross-owner coordination and arbitrary daemon cleanup are not included. The concurrency cap is per parent TaskManager, not machine-wide.
 
 ```json
 { "action": "inspect", "id": "auth-fix" }
@@ -146,7 +162,7 @@ A completed/stopped child can be continued after a parent restart, with its orig
 
 Shutdown/reload/session replacement stops managed children and suppresses late parent notifications. Partial file changes are not rolled back. Continuation requires confirmed shutdown and an exclusive lock. After an abrupt parent crash, records/locks are deliberately not auto-adopted: inspect orphan processes manually and start a fresh task if uncertain. Do not delete a lock and reopen a session while its old writer might still be alive.
 
-There is no automatic concurrency cap or total execution deadline in v1. Assign a small number of independent tasks and cancel unwanted work. RPC command acknowledgements have a 15-second timeout; unknown acceptance causes failure/cleanup, never blind re-submission. Cancellation first waits a bounded time for outstanding prompt preflight receipts, including late receipts after caller timeout, then clears queued work and waits for an abort/idle acknowledgement before stdin shutdown, with bounded signal escalation. Pi 0.84.2 does not expose `clear_queue` over RPC, so the compatibility path aborts and then requires `get_state` to prove that the queue is empty; otherwise shutdown remains unconfirmed and retains the lock. New submissions are rejected while stopping; an idle abort alone cannot confirm cleanup while a prompt hook remains unresolved. If agent/tool cleanup or process exit cannot be confirmed, cancellation reports failure and retains the lock; root-process exit alone is not confirmation. An accepted prompt consumed by an input hook without starting or queueing work fails explicitly instead of remaining live. Arbitrary daemonized commands are outside this lifecycle guarantee. Linux/macOS process groups are supported; full Windows descendant cleanup is not yet validated.
+An owner-wide cap defaults to **8 child tasks**, configurable through `PI_SUBAGENT_MAX_CONCURRENT` (positive integer). It includes standalone and workflow children plus unconfirmed orphan records. Workflows wait for capacity; standalone launch/continue and explicit retry reject when full. Other parent processes are not counted. Validation commands have a separate ten-minute deadline and are not child-agent slots; ordinary agent tasks have no total execution deadline. Assign a small number of independent tasks and cancel unwanted work. RPC command acknowledgements have a 15-second timeout; unknown acceptance causes failure/cleanup, never blind re-submission. Cancellation first waits a bounded time for outstanding prompt preflight receipts, including late receipts after caller timeout, then clears queued work and waits for an abort/idle acknowledgement before stdin shutdown, with bounded signal escalation. Pi 0.84.2 does not expose `clear_queue` over RPC, so the compatibility path aborts and then requires `get_state` to prove that the queue is empty; otherwise shutdown remains unconfirmed and retains the lock. New submissions are rejected while stopping; an idle abort alone cannot confirm cleanup while a prompt hook remains unresolved. If agent/tool cleanup or process exit cannot be confirmed, cancellation reports failure and retains the lock; root-process exit alone is not confirmation. An accepted prompt consumed by an input hook without starting or queueing work fails explicitly instead of remaining live. Arbitrary daemonized commands are outside this lifecycle guarantee. Linux/macOS process groups are supported; full Windows descendant cleanup is not yet validated.
 
 ## Development and isolated trial
 

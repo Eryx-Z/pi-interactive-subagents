@@ -234,6 +234,40 @@ test('accepted unstarted reconciliation preserves queued work and rechecks lifec
   }
 });
 
+test('startup diagnostics reach caller and persisted record without submitting a task after failed preflight', async () => {
+  const { EventEmitter } = await import('node:events');
+  for (const [failure, category] of [
+    ['No API key found for test-provider', 'credentials'],
+    ['Requested model was not selected: test/model', 'model/provider'],
+    ['Inherited tool schema/provenance mismatch: read', 'loadout/extension'],
+    ['unexpected failure', 'startup'],
+  ]) {
+    const t = setup(), rpc = new EventEmitter() as any;
+    let prompts = 0, stops = 0;
+    rpc.request = async (type: string) => {
+      if (type === 'get_commands') return { commands: [{ name: 'rpc-subagent-preflight' }] };
+      if (type === 'prompt') { prompts++; throw new Error(failure); }
+      return {};
+    };
+    rpc.stop = async () => { stops++; };
+    const manager = new TaskManager(new TaskStore(t.dir), { command: 'unused', createRpc: () => rpc });
+    try {
+      await assert.rejects(manager.launch({ task: 'never sent', access: 'full', context: 'none', loadout: t.loadout }), (e: Error) => {
+        assert.ok(e.message.includes(`[subagent ${category}]`));
+        assert.ok(e.message.includes(failure));
+        return true;
+      });
+      const record = [...manager.records.values()][0];
+      assert.match(record.error!, /phase=loadout preflight/);
+      assert.ok(record.error!.includes(t.loadout.model));
+      assert.ok(record.error!.includes(t.loadout.agentDir));
+      assert.equal(record.state, 'failed'); assert.equal(record.stopped, true);
+      assert.equal(prompts, 1); assert.equal(stops, 1);
+      const release = manager.store.lock(record.id); release();
+    } finally { await manager.shutdown(); await t.clean(); }
+  }
+});
+
 test('late startup rejection cannot release an unconfirmed stopped writer lock', async () => {
   const { EventEmitter } = await import('node:events');
   const t = setup(), rpc = new EventEmitter() as any;

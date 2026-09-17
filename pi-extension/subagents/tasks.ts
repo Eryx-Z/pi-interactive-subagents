@@ -5,6 +5,7 @@ import { CHILD_EXTENSION, validateLoadout, applyAccess, accessMode, type AccessM
 import { atomicWrite, addLog, bounded, uniqueName, TaskStore, type TaskRecord } from "./store.ts";
 import { COOPERATION, seedSession, taskPrompt, type ContextMode } from "./context.ts";
 import type { AgentMessage } from "./context.ts";
+import { diagnoseFailure } from "./diagnostics.ts";
 
 export interface NewTask {
   name?: string; task: string; access: AccessMode; context: ContextMode; contextText?: string;
@@ -13,6 +14,7 @@ export interface NewTask {
 }
 interface LiveRun {
   rpc: RpcProcess; release: () => void; finishing?: Promise<void>; pendingMessages: number;
+  startupPhase?: string;
   settled: boolean; lastStop?: string; lastError?: string; started: boolean; askToolCallId?: string;
   persistTimer?: ReturnType<typeof setTimeout>; settleChecking?: boolean; checkAgain?: boolean;
   finalTools: Map<string, boolean>; finalOutput: Map<string, string>; submission: number;
@@ -48,11 +50,13 @@ export class TaskManager {
   private listeners = new Set<() => void>();
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
   isLive(id: string): boolean { return this.live.has(id); }
+  hasCapacity(): boolean { return [...this.records.values()].filter(r => !r.stopped).length < (this.options.maxConcurrent ?? 8); }
   constructor(readonly store: TaskStore, private options: {
-    command: string; baseArgs?: string[];
+    command: string; baseArgs?: string[]; maxConcurrent?: number;
     createRpc?: (launch: RpcLaunch) => RpcProcess;
     changed?: () => void; notify?: (record: TaskRecord, kind: "result" | "question") => void;
   }) {
+    if (!Number.isInteger(options.maxConcurrent ?? 8) || (options.maxConcurrent ?? 8) < 1) throw new Error("maxConcurrent must be a positive integer");
     for (const record of store.load()) this.records.set(record.id, record);
   }
   private save(record: TaskRecord): void {
@@ -66,6 +70,7 @@ export class TaskManager {
   }
   async launch(input: NewTask): Promise<TaskRecord> {
     if (this.closed) throw new Error("Parent session is shutting down");
+    if (!this.hasCapacity()) throw new Error("Global subagent concurrency limit reached; wait for a child to stop");
     if (!input.task.trim()) throw new Error("Task is required");
     const prompt = taskPrompt(input.task, input.access, input.context, input.contextText);
     validateLoadout(input.loadout);
@@ -96,6 +101,7 @@ export class TaskManager {
     const effective = applyAccess(available, selected);
     if (this.live.has(record.id)) throw new Error("Task is already running or stopping");
     this.store.validateForContinue(record);
+    if (!this.hasCapacity()) throw new Error("Global subagent concurrency limit reached; wait for a child to stop");
     const release = this.store.lock(record.id);
     record.version = 2; record.access = selected; record.availableLoadout = structuredClone(available); record.loadout = effective;
     record.state = "running"; record.stopped = false; record.run++; record.error = undefined;
@@ -109,11 +115,12 @@ export class TaskManager {
   private async start(record: TaskRecord, prompt: string, reserved?: () => void): Promise<void> {
     let release = reserved;
     let spawned = false;
+    let phase = "launch";
     try {
       release ??= this.store.lock(record.id);
       const launch = childLaunch(record, this.store.dir, this.options.command, this.options.baseArgs);
       const rpc = (this.options.createRpc ?? (l => new RpcProcess(l)))(launch);
-      const live: LiveRun = { rpc, release, pendingMessages: 1, settled: false, started: false, finalTools: new Map(), finalOutput: new Map(), submission: 0 };
+      const live: LiveRun = { rpc, release, startupPhase: phase, pendingMessages: 1, settled: false, started: false, finalTools: new Map(), finalOutput: new Map(), submission: 0 };
       this.live.set(record.id, live);
       spawned = true;
       rpc.on("event", event => {
@@ -124,22 +131,26 @@ export class TaskManager {
       rpc.on("closed", detail => {
         if (!live.finishing) void this.finish(record, "failed", `Unexpected child exit: ${detail.code ?? detail.signal}\n${detail.stderr}`);
       });
+      phase = live.startupPhase = "RPC readiness";
       await rpc.request("get_state"); // readiness, not a timed sleep
       await rpc.request("set_auto_retry", { enabled: false });
+      phase = live.startupPhase = "loadout preflight";
       const commands = await rpc.request("get_commands");
       if (!commands?.commands?.some((c: { name: string }) => c.name === "rpc-subagent-preflight")) throw new Error("Child bridge did not load; refusing to send any model prompt");
       await rpc.request("prompt", { message: "/rpc-subagent-preflight" });
       if (live.finishing || this.closed) throw new Error("Child failed during preflight");
+      phase = live.startupPhase = "initial prompt";
       await rpc.request("prompt", { message: prompt });
+      live.startupPhase = undefined;
       live.pendingMessages--;
       addLog(record, "Initial task accepted by RPC (not a completion acknowledgement)");
       this.save(record); this.maybeComplete(record, live);
     } catch (e) {
       if (spawned) await this.finish(record, "failed", String(e));
       else {
-        release?.(); record.state = "failed"; record.error = String(e); record.stopped = true; this.save(record);
+        release?.(); record.state = "failed"; record.error = diagnoseFailure(String(e), record.loadout, phase); record.stopped = true; this.save(record);
       }
-      throw e;
+      throw new Error(diagnoseFailure(String(e), record.loadout, phase), { cause: e });
     }
   }
   private event(record: TaskRecord, live: LiveRun, event: RpcEvent): void {
@@ -231,6 +242,7 @@ export class TaskManager {
     const live = this.live.get(record.id);
     if (!live) return Promise.resolve();
     if (live.finishing) return live.finishing;
+    if (error) error = diagnoseFailure(error, record.loadout, live.startupPhase);
     // Install promise before stopping: close/fault callbacks must never finalize twice.
     if (live.persistTimer) clearTimeout(live.persistTimer);
     live.finishing = Promise.resolve().then(async () => {

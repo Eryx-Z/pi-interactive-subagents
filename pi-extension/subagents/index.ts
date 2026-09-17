@@ -57,6 +57,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
     const dir = join(ctx.sessionManager.getSessionDir(), "rpc-subagents", ctx.sessionManager.getSessionId());
     manager = new TaskManager(new TaskStore(dir), {
+      maxConcurrent: Number(process.env.PI_SUBAGENT_MAX_CONCURRENT ?? 8),
       command: process.execPath, baseArgs: [cli],
       notify(record, kind) {
         const content = kind === "question"
@@ -127,8 +128,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
   pi.registerTool({
     name: "workflow_run", label: "Run workflow",
-    description: "Define and start a persistent dependency graph of subagent steps. Each step requires access and dependsOn (empty for roots). Workflow initial context is none/partial/full; each step also receives direct dependency results. Read-only steps may run in parallel; full steps run exclusively within this workflow (not across other workflows, standalone subagents or external writers). Failure pauses future dispatch; no automatic retry. Results/questions arrive automatically. Completion is not acceptance: include explicit validation/review steps.",
-    parameters: Type.Object({ ...contextFields, steps: Type.Array(stepSchema, { minItems: 1, maxItems: 64 }), maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })) }, { additionalProperties: false }),
+    description: "Define and start a persistent dependency graph of subagent steps. Each step requires access and dependsOn (empty for roots). Workflow initial context is none/partial/full; each step also receives direct dependency results. Default shared mode: full steps run exclusively within this workflow only. Opt-in workspace=isolated permits concurrent writers in detached Git worktrees, requires a clean Git repository and validationCommand, merges dependency code before downstream launch, then integrates and validates without altering the source checkout. Worktrees are not sandboxes. Conflicts pause and preserve worktrees. Failure pauses future dispatch; no automatic retry. Results/questions arrive automatically. Completion is not acceptance: include explicit validation/review steps.",
+    parameters: Type.Object({ ...contextFields, steps: Type.Array(stepSchema, { minItems: 1, maxItems: 64 }), maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })), workspace: Type.Optional(StringEnum(["shared", "isolated"] as const)), validationCommand: Type.Optional(Type.String({ minLength: 1 })) }, { additionalProperties: false }),
     async execute(id, p, signal, _update, ctx) {
       signal?.throwIfAborted(); const mode = p.context ?? "partial";
       const r = workflow().launch({ ...p, context: mode, snapshot: snapshot(id, mode, ctx), loadout: loadout(ctx, p), parentSession: ctx.sessionManager.getSessionFile() });
