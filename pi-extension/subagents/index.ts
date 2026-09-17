@@ -8,7 +8,7 @@ import { snapshotContext } from "./context.ts";
 import { TaskStore, bounded, toolHistory } from "./store.ts";
 import { TaskManager } from "./tasks.ts";
 import { WorkflowManager, workflowSummary } from "./workflows.ts";
-import { detail, resultRenderer, taskMenu, taskSummary, widget } from "./ui.ts";
+import { detail, resultRenderer, taskMenu, taskSummary, widget, TaskWidget } from "./ui.ts";
 import type { AgentMessage } from "./context.ts";
 
 const result = (text: string) => ({ content: [{ type: "text" as const, text: bounded(text, 16000) }], details: {} });
@@ -52,7 +52,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     snapshots.delete(id); return value;
   }
   pi.on("session_start", (_event, ctx) => {
+    if (interval) clearInterval(interval);
+    interval = undefined;
+    ctx.ui.setWidget("rpc-subagents", undefined);
     if (!ctx.sessionManager.getSessionFile()) return;
+    const display = new TaskWidget();
     ctxForWidget = ctx;
     const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
     const dir = join(ctx.sessionManager.getSessionDir(), "rpc-subagents", ctx.sessionManager.getSessionId());
@@ -60,6 +64,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       maxConcurrent: Number(process.env.PI_SUBAGENT_MAX_CONCURRENT ?? 8),
       command: process.execPath, baseArgs: [cli],
       notify(record, kind) {
+        if (kind === "result") display.result(record);
         const content = kind === "question"
           ? `Subagent ${record.name} (${record.id}) needs an answer:\n${record.questions.filter(q => !q.responseSent).map(q => `${q.id}: ${q.title}`).join("\n")}\nUse subagent_control action=answer with id, questionId, message.`
           : `Subagent ${record.name} (${record.id}) ${record.state}.\n${record.error ?? ""}\n${bounded(record.output)}\nSession: ${record.sessionFile}\nStopping is not acceptance: review its validation and shared-workspace changes.`;
@@ -69,12 +74,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     workflows = new WorkflowManager(manager, join(dir, "workflows"), r => {
       pi.sendMessage({ customType: "rpc_workflow_result", content: `${workflowSummary(r)}\nStep completion is not independent acceptance; inspect reports and validation.`, display: true, details: { id: r.id, state: r.state } }, { deliverAs: "steer", triggerTurn: true });
     });
-    interval = setInterval(() => { if (manager && ctxForWidget) widget(manager, ctxForWidget); }, 500);
-    widget(manager, ctx);
+    interval = setInterval(() => { if (manager && ctxForWidget) widget(manager, ctxForWidget, display); }, 500);
+    widget(manager, ctx, display);
   });
   pi.on("session_shutdown", async () => {
     if (interval) clearInterval(interval);
     interval = undefined; snapshots.clear(); skills = undefined;
+    ctxForWidget?.ui.setWidget("rpc-subagents", undefined);
     const old = manager, oldFlows = workflows;
     manager = undefined; workflows = undefined; ctxForWidget = undefined;
     try { await oldFlows?.shutdown(); } finally { await old?.shutdown(); }
