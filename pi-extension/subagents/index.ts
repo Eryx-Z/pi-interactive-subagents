@@ -28,8 +28,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   let workflows: WorkflowManager | undefined;
   let ctxForWidget: ExtensionContext | undefined;
   let interval: ReturnType<typeof setInterval> | undefined;
-  let skills: Skill[] | undefined;
-  pi.on("before_agent_start", event => { skills = structuredClone(event.systemPromptOptions.skills); });
+  let promptOptions: { skills?: Skill[] } | undefined;
+  // Later handlers may replace the skills array. Freeze the final inventory at dispatch,
+  // not while the before_agent_start handler chain is still running.
+  pi.on("before_agent_start", event => { promptOptions = event.systemPromptOptions; });
   const snapshots = new Map<string, AgentMessage[]>();
   function current(): TaskManager {
     if (!manager) throw new Error("Subagents require an active persistent parent session");
@@ -45,7 +47,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (slash < 1) throw new Error("Use a canonical provider/model ID");
     const model = ctx.modelRegistry.find(requested.slice(0, slash), requested.slice(slash + 1));
     if (!model) throw new Error(`Model not found: ${requested}`);
-    return resolveLoadout(pi, skills, resolve(ctx.cwd, params.cwd ?? "."), `${model.provider}/${model.id}`, ctx.thinkingLevel ?? "medium");
+    return resolveLoadout(pi, promptOptions?.skills, resolve(ctx.cwd, params.cwd ?? "."), `${model.provider}/${model.id}`, ctx.thinkingLevel ?? "medium");
   }
   function snapshot(id: string, mode: string, ctx: ExtensionContext) {
     const value = mode === "full" ? snapshots.get(id) ?? snapshotContext(ctx.sessionManager) : undefined;
@@ -82,7 +84,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
   pi.on("session_shutdown", async () => {
     if (interval) clearInterval(interval);
-    interval = undefined; snapshots.clear(); skills = undefined;
+    interval = undefined; snapshots.clear(); promptOptions = undefined;
     ctxForWidget?.ui.setWidget("rpc-subagents", undefined);
     const old = manager, oldFlows = workflows;
     manager = undefined; workflows = undefined; ctxForWidget = undefined;

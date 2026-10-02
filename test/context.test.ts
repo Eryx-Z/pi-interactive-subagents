@@ -8,6 +8,7 @@ import { snapshotContext, seedSession, taskPrompt, closePendingCalls } from "../
 
 test("full snapshot uses active branch including current turn, not abandoned branches", () => {
   const sm = SessionManager.inMemory('/tmp');
+  sm.appendMessage({ role: "system", content: "private parent system", timestamp: 0 });
   const first = sm.appendMessage({ role: "user", content: "base", timestamp: 0 });
   sm.appendMessage({ role: "user", content: "abandoned", timestamp: 1 });
   sm.branch(first);
@@ -15,19 +16,22 @@ test("full snapshot uses active branch including current turn, not abandoned bra
   const snapshot = snapshotContext(sm);
   assert.equal(snapshot.length, 2);
   assert.match(JSON.stringify(snapshot), /latest useful/);
-  assert.doesNotMatch(JSON.stringify(snapshot), /abandoned/);
+  assert.doesNotMatch(JSON.stringify(snapshot), /abandoned|private parent system/);
+  assert.equal(snapshot.some(message => message.role === "system"), false);
   sm.appendMessage({ role: "user", content: "later parent message", timestamp: 3 });
   assert.doesNotMatch(JSON.stringify(snapshot), /later parent/);
 });
 test("full snapshot respects compaction summaries and retained context", () => {
   const sm = SessionManager.inMemory('/tmp');
+  sm.appendMessage({ role: "system", content: "private compaction checkpoint", timestamp: 0 });
   sm.appendMessage({ role: "user", content: "old huge context", timestamp: 0 });
   const keep = sm.appendMessage({ role: "user", content: "retained", timestamp: 1 });
   sm.appendCompaction("summary", keep, 100);
   sm.appendMessage({ role: "user", content: "current", timestamp: 2 });
   const snap = JSON.stringify(snapshotContext(sm));
   assert.match(snap, /summary/); assert.match(snap, /retained/); assert.match(snap, /current/);
-  assert.doesNotMatch(snap, /old huge context/);
+  assert.equal(sm.getBranch().find(entry => entry.type === "compaction")?.systemMessage?.role, "system");
+  assert.doesNotMatch(snap, /old huge context|private compaction checkpoint/);
 });
 test("none/partial seed empty sessions; full seeds reference messages and closes pending parent calls", () => {
   const dir = mkdtempSync(join(tmpdir(), 'context-'));
@@ -47,6 +51,29 @@ test("none/partial seed empty sessions; full seeds reference messages and closes
     assert.throws(() => taskPrompt('task', 'full', 'partial'), /requires/);
     assert.throws(() => taskPrompt('task', 'full', 'none', 'accidental history'), /only supported/);
     assert.doesNotMatch(taskPrompt('task', 'full', 'none'), /selected background/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+test("full seed excludes supplied system messages but preserves summaries and completed tool results", () => {
+  const dir = mkdtempSync(join(tmpdir(), 'context-'));
+  try {
+    const sm = SessionManager.inMemory(dir);
+    sm.appendMessage({ role: 'system', content: 'private checkpoint', timestamp: 0 });
+    const keep = sm.appendMessage({ role: 'user', content: 'retained user', timestamp: 1 });
+    sm.appendCompaction('useful summary', keep, 100);
+    sm.appendMessage({ role: 'assistant', content: [{ type: 'toolCall', id: 'done', name: 'read', arguments: {} }], timestamp: 2 } as any);
+    sm.appendMessage({ role: 'toolResult', toolCallId: 'done', toolName: 'read', content: [{ type: 'text', text: 'completed result' }], isError: false, timestamp: 3 });
+    // Exercise seed's own boundary even when its caller did not use snapshotContext.
+    const { messages } = sm.buildSessionContext();
+    messages.push({ role: 'system', content: 'private parent instruction', timestamp: 4 });
+    const original = structuredClone(messages);
+    const path = join(dir, 'full.jsonl');
+    seedSession(path, dir, 'full', messages);
+    const seeded = readFileSync(path, 'utf8').trim().split('\n').slice(1).map(line => JSON.parse(line).message);
+    assert.deepEqual(seeded, messages.filter(message => message.role !== 'system'));
+    assert.match(JSON.stringify(seeded), /useful summary|retained user/);
+    assert.match(JSON.stringify(seeded), /completed result/);
+    assert.doesNotMatch(JSON.stringify(seeded), /private checkpoint|private parent instruction/);
+    assert.deepEqual(messages, original);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 test("closePendingCalls closes multiple pending calls and preserves completed results", () => {

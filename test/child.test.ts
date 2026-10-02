@@ -23,6 +23,7 @@ test('child question tool awaits RPC UI answer, respects abort and enforces sequ
     } as any);
     handlers.session_start();
     const q = tools[0]; assert.equal(q.executionMode, 'sequential');
+    assert.equal(q.exposure, 'model-only', 'Question bridge must not be callable by nested tools');
     let answer!: (value: string) => void;
     let completed = false;
     const pending = q.execute('tool-q', { question: 'Which?' }, undefined, undefined, {

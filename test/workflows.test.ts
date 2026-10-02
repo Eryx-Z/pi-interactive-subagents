@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkflowManager, validateSteps, type StepDefinition } from '../pi-extension/subagents/workflows.ts';
 import { TaskManager } from '../pi-extension/subagents/tasks.ts';
-import { TaskStore } from '../pi-extension/subagents/store.ts';
+import { atomicWrite, TaskStore } from '../pi-extension/subagents/store.ts';
 import { RpcProcess } from '../pi-extension/subagents/rpc.ts';
 import { loadout } from './fixtures/loadout.ts';
 const fake = fileURLToPath(new URL('./fixtures/fake-rpc.mjs', import.meta.url));
@@ -85,6 +86,62 @@ test('pause preserves active work, cancel stops it and never dispatches pending 
     assert.equal(r.state, 'cancelled'); assert.equal(r.steps[1].state, 'cancelled');
     assert.equal(t.tasks.get(r.steps[0].taskId!).stopped, true);
   } finally { await t.clean(); }
+});
+test('stale historical loadouts remain inspectable and block only their own resume/retry', async () => {
+  const t = setup(); let restored: WorkflowManager | undefined;
+  try {
+    const healthy = t.launch([step('a')]);
+    t.workflows.pause(healthy.id);
+    await t.workflows.shutdown();
+    const staleIds: string[] = [];
+    for (const resource of ['cwd', 'skill', 'extension', 'provider']) {
+      const stale = structuredClone(healthy);
+      stale.id = randomUUID(); stale.name = `stale-${resource}`;
+      const missing = join(t.dir, `missing-${resource}`);
+      if (resource === 'cwd') stale.loadout.cwd = missing;
+      if (resource === 'skill') stale.loadout.skills = [{ name: 'removed', description: 'Removed skill', filePath: missing,
+        loadPath: missing, baseDir: t.dir, disableModelInvocation: false }];
+      if (resource === 'extension') {
+        stale.loadout.toolMetadata[0].source = 'extension'; stale.loadout.toolMetadata[0].path = missing;
+        stale.loadout.extensions = [missing];
+      }
+      if (resource === 'provider') stale.loadout.providerExtensions = [missing];
+      atomicWrite(join(t.dir, 'workflows', `${stale.id}.json`), JSON.stringify(stale));
+      staleIds.push(stale.id);
+    }
+    restored = new WorkflowManager(t.tasks, join(t.dir, 'workflows'));
+    assert.equal(restored.records.size, 5);
+    for (const id of staleIds) {
+      const stale = restored.get(id);
+      assert.equal(stale.state, 'paused');
+      assert.throws(() => restored!.resume(id), /missing|exist|ENOENT/);
+      assert.equal(restored.get(id), stale);
+      assert.equal(stale.state, 'paused'); assert.equal(stale.steps[0].taskId, undefined);
+      stale.steps[0].state = 'failed';
+      await assert.rejects(restored.retry(id, 'a', 'try again'), /missing|exist|ENOENT/);
+      assert.equal(stale.steps[0].state, 'failed'); assert.equal(stale.steps[0].taskId, undefined);
+    }
+    restored.resume(healthy.id);
+    await until(() => restored!.get(healthy.id).state === 'completed');
+    assert.equal(t.tasks.records.size, 1);
+    for (const id of staleIds) assert.equal(restored.get(id).state, 'paused');
+  } finally { await restored?.shutdown(); await t.clean(); }
+});
+test('dispatch revalidates resources removed after resume without blocking healthy workflows', async () => {
+  const t = setup();
+  const cwd = mkdtempSync(join(tmpdir(), 'workflow-cwd-'));
+  try {
+    const stale = t.workflows.launch({ context: 'none', loadout: loadout(cwd), steps: [step('a')] });
+    t.workflows.pause(stale.id);
+    t.workflows.resume(stale.id);
+    rmSync(cwd, { recursive: true, force: true });
+    const healthy = t.launch([step('a')]);
+    await until(() => stale.state === 'paused' && healthy.state === 'completed');
+    assert.match(stale.error!, /exist|ENOENT/);
+    assert.equal(stale.steps[0].state, 'pending'); assert.equal(stale.steps[0].taskId, undefined);
+    assert.equal(t.workflows.get(stale.id), stale);
+    assert.equal(t.tasks.records.size, 1);
+  } finally { rmSync(cwd, { recursive: true, force: true }); await t.clean(); }
 });
 test('restart remains paused, reconciles missing task linkage, and blocks orphan writers', async () => {
   const t = setup(); let restored: WorkflowManager | undefined;

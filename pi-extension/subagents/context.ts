@@ -15,7 +15,7 @@ Finish with a handoff report: completion status (complete/partial/blocked), file
 
 /** Called at tool preflight: the session is synchronized through the current assistant message. */
 export function snapshotContext(sm: ExtensionContext["sessionManager"]): AgentMessage[] {
-  return structuredClone(buildSessionContext(sm.getBranch(), sm.getLeafId()).messages);
+  return structuredClone(buildSessionContext(sm.getBranch(), sm.getLeafId()).messages.filter(message => message.role !== "system"));
 }
 
 /** A dispatch snapshot can contain pending parent tool calls. Close them in the copy only. */
@@ -44,7 +44,7 @@ export function seedSession(path: string, cwd: string, mode: ContextMode, snapsh
   const now = new Date().toISOString();
   const lines: unknown[] = [{ type: "session", version: 3, id: randomUUID(), timestamp: now, cwd, ...(parentSession ? { parentSession } : {}) }];
   let parentId: string | null = null;
-  for (const message of mode === "full" ? closePendingCalls(snapshot) : []) {
+  for (const message of mode === "full" ? closePendingCalls(snapshot.filter(message => message.role !== "system")) : []) {
     const id = randomUUID().slice(0, 8);
     lines.push({ type: "message", id, parentId, timestamp: now, message });
     parentId = id;

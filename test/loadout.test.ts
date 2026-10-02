@@ -107,6 +107,60 @@ test("tool preflight rejects absent tools, builtin substitution, changed schemas
     assert.throws(() => verifyTools({...l, tools: ["ask_question"], toolMetadata: []}, [t.question]), /bridge was replaced/);
   } finally { t.clean(); }
 });
+test("builtin provenance accepts Pi 1.0 paths and normalizes legacy snapshots without trusting names", () => {
+  const t = setup();
+  try {
+    const legacy = readInfo(t.dir);
+    const modern = { ...legacy, sourceInfo: { ...legacy.sourceInfo, path: "builtin:read" } };
+    const api = (tool: typeof legacy) => ({ getActiveTools: () => ["read"], getAllTools: () => [tool] });
+    const l = resolveLoadout(api(modern), [], t.dir, "fake/test", "off", t.dir);
+    assert.deepEqual(l, resolveLoadout(api(legacy), [], t.dir, "fake/test", "off", t.dir));
+    assert.equal(l.toolMetadata[0].path, "<builtin:read>");
+    verifyTools(l, [modern, t.question]);
+    verifyTools(l, [legacy, t.question]);
+    assert.deepEqual(applyAccess(l, "read-only").tools, ["read", "ask_question"]);
+    for (const path of ["builtin:write", "<builtin:write>", t.source, "read", ""]) {
+      assert.throws(() => resolveLoadout(api({ ...modern, sourceInfo: { ...modern.sourceInfo, path } }), [], t.dir, "fake/test", "off", t.dir), /Invalid builtin provenance/);
+    }
+    const custom = { ...modern, sourceInfo: { ...modern.sourceInfo, source: "extension", path: t.source } };
+    assert.deepEqual(applyAccess(resolveLoadout(api(custom), [], t.dir, "fake/test", "off", t.dir), "read-only").tools, ["ask_question"]);
+    assert.throws(() => resolveLoadout({ getActiveTools: () => ["unknown"], getAllTools: () => [{ ...modern, name: "unknown", sourceInfo: { ...modern.sourceInfo, path: "builtin:unknown" } }] }, [], t.dir, "fake/test", "off", t.dir), /Invalid builtin provenance/);
+  } finally { t.clean(); }
+});
+test("tool inheritance freezes exposure, namespace and annotations and rejects semantic drift", () => {
+  const t = setup();
+  try {
+    const tool = { ...t.tool, exposure: "model-only" as const, namespace: { name: "fixture", description: "Original group" }, annotations: { readOnlyHint: true } };
+    const api = { getActiveTools: () => [tool.name], getAllTools: () => [tool] };
+    const l = resolveLoadout(api, [], t.dir, "fake/test", "off", t.dir);
+    verifyTools(l, [tool, t.question]);
+    assert.equal(l.toolMetadata[0].exposure, "model-only");
+    tool.namespace.description = "Changed group";
+    assert.equal(l.toolMetadata[0].namespace?.description, "Original group");
+    assert.throws(() => verifyTools(l, [tool, t.question]), /schema\/provenance mismatch/);
+    tool.namespace.description = "Original group";
+    for (const changed of [{ ...tool, exposure: "direct" as const }, { ...tool, annotations: { readOnlyHint: false } }]) {
+      assert.throws(() => verifyTools(l, [changed, t.question]), /schema\/provenance mismatch/);
+    }
+    const legacy = resolveLoadout(t.api, [], t.dir, "fake/test", "off", t.dir);
+    for (const metadata of legacy.toolMetadata) delete metadata.exposure;
+    verifyTools(legacy, [...t.api.getAllTools(), t.question]);
+    assert.throws(() => verifyTools(legacy, [{ ...t.tool, exposure: "model-only" }, readInfo(t.dir), t.question]), /schema\/provenance mismatch/);
+  } finally { t.clean(); }
+});
+test("historical loadout validation checks structure without requiring live resources", () => {
+  const t = setup();
+  try {
+    const l = resolveLoadout(t.api, [t.skill], t.dir, "fake/test", "off", t.dir);
+    l.providerExtensions = [t.source];
+    t.clean();
+    assert.equal(validateLoadout(l, { resources: false }), l);
+    assert.throws(() => validateLoadout(l));
+    assert.throws(() => validateLoadout({ ...l, cwd: "relative" }, { resources: false }), /absolute/);
+    assert.throws(() => validateLoadout({ ...l, extensions: [] }, { resources: false }), /Extension sources/);
+    assert.throws(() => validateLoadout({ ...l, providerExtensions: ["relative"] }, { resources: false }), /absolute/);
+  } finally { t.clean(); }
+});
 test("skill preflight verifies exact canonical inventory and metadata, including hidden skills", () => {
   const t = setup();
   try {

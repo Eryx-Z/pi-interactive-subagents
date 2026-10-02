@@ -13,7 +13,7 @@ export default function childBridge(pi: ExtensionAPI) {
   // reserved question tool wins even when an inherited provider also defines it.
   pi.on("session_start", () => { pi.registerTool({
     name: "ask_question", label: "Ask parent", description: "Ask the parent a decision question. This tool blocks until the matching answer arrives.",
-    executionMode: "sequential",
+    executionMode: "sequential", exposure: "model-only",
     parameters: Type.Object({ question: Type.String({ minLength: 1 }) }),
     async execute(_id, params, signal, _update, ctx) {
       if (ctx.mode !== "rpc") throw new Error("ask_question requires the RPC parent bridge");

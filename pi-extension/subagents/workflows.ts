@@ -59,7 +59,7 @@ export class WorkflowManager {
     for (const file of readdirSync(dir).filter(f => /^[a-f0-9-]{36}\.json$/.test(f))) {
       const r = JSON.parse(readFileSync(join(dir, file), "utf8")) as WorkflowRecord;
       if (r.version !== 1 || `${r.id}.json` !== file || !["running", "paused", "completed", "cancelled"].includes(r.state)) throw new Error(`Invalid workflow record: ${file}`);
-      validateSteps(r.steps); validateLoadout(r.loadout);
+      validateSteps(r.steps); validateLoadout(r.loadout, { resources: false });
       taskPrompt("workflow", "full", r.context, r.contextText);
       if (!Number.isInteger(r.maxParallel) || r.maxParallel < 1 || r.maxParallel > 16 ||
           r.steps.some(s => !["pending", "running", "completed", "failed", "cancelled"].includes(s.state))) throw new Error(`Invalid workflow state: ${file}`);
@@ -153,6 +153,7 @@ export class WorkflowManager {
   }
   private async dispatch(r: WorkflowRecord): Promise<void> {
     if (this.integrationRuns.has(r.id)) return;
+    validateLoadout(r.loadout);
     if (this.unsafe(r)) throw new Error("Unconfirmed workflow child/validation shutdown; inspect orphan processes before scheduling");
     if (r.workspace === "isolated") {
       if (!r.isolation) { r.isolation = await initialize(r.loadout.cwd, join(this.dir, `${r.id}-worktrees`)); this.save(r); }
@@ -223,6 +224,7 @@ export class WorkflowManager {
     if (r.state !== "paused") throw new Error("Only paused workflows can resume");
     if (this.unsafe(r)) throw new Error("Unconfirmed child shutdown; cannot resume");
     if (r.steps.some(s => s.state === "failed" || s.state === "cancelled")) throw new Error("Explicitly retry failed/cancelled steps before resume");
+    validateLoadout(r.loadout);
     r.state = "running"; r.error = undefined; this.save(r); this.schedule();
   }
   update(id: string, updates: StepDefinition[]): void {
@@ -251,6 +253,7 @@ export class WorkflowManager {
     for (let i = 0; i < r.steps.length; i++) for (const d of r.steps) if (d.dependsOn.some(id => descendants.has(id))) descendants.add(d.id);
     if (r.steps.some(d => d.id !== s.id && descendants.has(d.id) && (d.state !== "pending" || !!d.worktree))) throw new Error("A dependent step already started; cannot silently invalidate its input");
     const selected = accessMode(access ?? s.access);
+    validateLoadout(r.loadout);
     if (!this.tasks.hasCapacity()) throw new Error("Global subagent concurrency limit reached");
     const task = this.findTask(r, s);
     if (!task) {

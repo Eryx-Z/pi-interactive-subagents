@@ -28,6 +28,8 @@ type ToolInfo = ReturnType<ExtensionAPI["getAllTools"]>[number];
 export interface ToolSnapshot {
   name: string; description: string; parameters: ToolInfo["parameters"]; promptGuidelines?: string[];
   source: "builtin" | "extension"; path: string;
+  /** Missing exposure in legacy v2 records means the historical direct default. */
+  exposure?: ToolInfo["exposure"]; namespace?: ToolInfo["namespace"]; annotations?: ToolInfo["annotations"];
 }
 export interface SkillSnapshot {
   name: string; description: string; filePath: string; baseDir: string; disableModelInvocation: boolean;
@@ -61,10 +63,14 @@ export function snapshotTool(tool: ToolInfo): ToolSnapshot {
   const source = tool.sourceInfo?.source === "builtin" ? "builtin" : "extension";
   if (tool.sourceInfo?.source === "sdk") throw new Error(`Cannot inherit tool ${tool.name}: SDK tools have no reloadable implementation`);
   const path = source === "builtin" ? `<builtin:${tool.name}>` : file(tool.sourceInfo?.path, `tool ${tool.name}`);
-  if (source === "builtin" && (!BUILTIN_TOOLS.has(tool.name) || tool.sourceInfo.path !== path)) throw new Error(`Invalid builtin provenance: ${tool.name}`);
+  // Pi 1.0 uses builtin:<name>; older hosts used <builtin:<name>>.
+  // Keep persisted snapshots canonical and reject mismatched names or sources.
+  if (source === "builtin" && (!BUILTIN_TOOLS.has(tool.name) ||
+      (tool.sourceInfo.path !== path && tool.sourceInfo.path !== `builtin:${tool.name}`))) throw new Error(`Invalid builtin provenance: ${tool.name}`);
   // Tool schemas are JSON on the wire; discard TypeBox's symbol metadata, not schema fields.
   return JSON.parse(JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters,
-    promptGuidelines: tool.promptGuidelines, source, path }));
+    promptGuidelines: tool.promptGuidelines, exposure: tool.exposure ?? "direct",
+    namespace: tool.namespace, annotations: tool.annotations, source, path }));
 }
 export function snapshotSkills(skills: readonly Skill[]): SkillSnapshot[] {
   return skills.map(s => ({ name: s.name, description: s.description, filePath: file(s.filePath, `skill ${s.name}`),
@@ -90,35 +96,47 @@ export function resolveLoadout(pi: Pick<ExtensionAPI, "getActiveTools" | "getAll
     extensions: [...new Set(toolMetadata.filter(t => t.source === "extension").map(t => t.path))],
     skills: snapshotSkills(skills), model, thinking, cwd: realpathSync(cwd), agentDir: resolve(configDir) });
 }
-export function validateLoadout(value: unknown): Loadout {
+export function validateLoadout(value: unknown, options: { resources?: boolean } = {}): Loadout {
+  const resources = options.resources !== false;
+  const sourcePath = (path: string, label: string) => {
+    if (resources) return file(path, label);
+    if (typeof path !== "string" || !isAbsolute(path)) throw new Error(`Cannot inherit ${label}: no absolute file-backed source`);
+    return path;
+  };
   const l = value as Loadout;
   if (!l || l.version !== 2 || !Array.isArray(l.tools) || !Array.isArray(l.toolMetadata) || !Array.isArray(l.extensions) || !Array.isArray(l.skills)) {
     throw new Error("Invalid v2 inherited loadout; legacy profile tasks cannot be continued, launch a new task");
   }
   for (const key of ["model", "thinking", "cwd", "agentDir"] as const) nonempty(l[key], `loadout.${key}`);
-  if (!isAbsolute(l.cwd) || !isAbsolute(l.agentDir) || !statSync(l.cwd).isDirectory()) throw new Error("Loadout cwd/config must be absolute and cwd must exist");
+  if (!isAbsolute(l.cwd) || !isAbsolute(l.agentDir) || (resources && !statSync(l.cwd).isDirectory())) throw new Error("Loadout cwd/config must be absolute and cwd must exist");
   if (!/^[^/]+\/.+/.test(l.model)) throw new Error("Use a canonical provider/model ID");
   if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(l.thinking)) throw new Error("Invalid thinking level");
   if (!l.tools.includes("ask_question") || new Set(l.tools).size !== l.tools.length ||
       l.tools.some(t => typeof t !== "string" || !/^[\w.-]+$/.test(t) || isDelegationTool(t))) throw new Error("Invalid child tool allowlist: nested delegation is disabled");
   if (!isDeepStrictEqual(l.toolMetadata.map(t => t.name), l.tools.filter(n => n !== "ask_question"))) throw new Error("Incomplete inherited tool metadata");
   for (const t of l.toolMetadata) {
-    if (typeof t.description !== "string" || !t.parameters || typeof t.parameters !== "object") throw new Error(`Invalid tool metadata: ${t.name}`);
+    if (typeof t.description !== "string" || !t.parameters || typeof t.parameters !== "object" ||
+        (t.exposure !== undefined && !["direct", "model-only", "codemode", "deferred", "hidden"].includes(t.exposure)) ||
+        (t.namespace !== undefined && (!t.namespace || typeof t.namespace.name !== "string" || !t.namespace.name.trim())) ||
+        (t.annotations !== undefined && (!t.annotations || typeof t.annotations !== "object" || Array.isArray(t.annotations) ||
+          Object.values(t.annotations).some(v => typeof v !== "boolean")))) throw new Error(`Invalid tool metadata: ${t.name}`);
     if (t.source === "builtin") {
       if (!BUILTIN_TOOLS.has(t.name) || t.path !== `<builtin:${t.name}>`) throw new Error(`Invalid builtin provenance: ${t.name}`);
-    } else if (t.source !== "extension" || file(t.path, `tool ${t.name}`) !== t.path) throw new Error(`Invalid tool provenance: ${t.name}`);
+    } else if (t.source !== "extension" || sourcePath(t.path, `tool ${t.name}`) !== t.path) throw new Error(`Invalid tool provenance: ${t.name}`);
   }
   const extensions = [...new Set(l.toolMetadata.filter(t => t.source === "extension").map(t => t.path))];
   if (!isDeepStrictEqual(l.extensions, extensions)) throw new Error("Extension sources do not match inherited tools");
   if (l.providerExtensions !== undefined && (!Array.isArray(l.providerExtensions) ||
       new Set(l.providerExtensions).size !== l.providerExtensions.length ||
-      l.providerExtensions.some(p => file(p, "model provider") !== p))) throw new Error("Invalid provider entrypoints");
+      l.providerExtensions.some(p => sourcePath(p, "model provider") !== p))) throw new Error("Invalid provider entrypoints");
   const names = new Set<string>();
   for (const s of l.skills) {
     nonempty(s.name, "skill.name"); nonempty(s.description, "skill.description");
-    if (names.has(s.name) || file(s.filePath, `skill ${s.name}`) !== s.filePath ||
-        file(s.loadPath ?? s.filePath, `skill ${s.name} load path`) !== s.filePath || !isAbsolute(s.baseDir) ||
-        realpathSync(s.baseDir) !== s.baseDir || !statSync(s.baseDir).isDirectory() || typeof s.disableModelInvocation !== "boolean") throw new Error(`Invalid skill snapshot: ${s.name}`);
+    if (names.has(s.name) || sourcePath(s.filePath, `skill ${s.name}`) !== s.filePath ||
+        (resources ? sourcePath(s.loadPath ?? s.filePath, `skill ${s.name} load path`) !== s.filePath :
+          !isAbsolute(s.loadPath ?? s.filePath)) || !isAbsolute(s.baseDir) ||
+        (resources && (realpathSync(s.baseDir) !== s.baseDir || !statSync(s.baseDir).isDirectory())) ||
+        typeof s.disableModelInvocation !== "boolean") throw new Error(`Invalid skill snapshot: ${s.name}`);
     names.add(s.name);
   }
   return l;
@@ -128,7 +146,8 @@ export function verifyTools(loadout: Loadout, tools: ToolInfo[]): void {
   for (const expected of loadout.toolMetadata) {
     const actual = all.get(expected.name);
     if (!actual) throw new Error(`Child is missing required tool: ${expected.name}`);
-    if (!isDeepStrictEqual(snapshotTool(actual), expected)) throw new Error(`Inherited tool schema/provenance mismatch: ${expected.name}`);
+    const normalized = { ...expected, exposure: expected.exposure ?? "direct" };
+    if (!isDeepStrictEqual(snapshotTool(actual), normalized)) throw new Error(`Inherited tool schema/provenance mismatch: ${expected.name}`);
   }
   const question = all.get("ask_question");
   if (!question || file(question.sourceInfo?.path, "ask_question") !== realpathSync(CHILD_EXTENSION)) throw new Error("Child ask_question bridge was replaced");
