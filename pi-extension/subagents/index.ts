@@ -1,8 +1,8 @@
-import type { ExtensionAPI, ExtensionContext, Skill } from "@earendil-works/pi-coding-agent";
+import { getPackageDir, type ExtensionAPI, type ExtensionContext, type Skill } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { join, resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
 import { nonempty, resolveLoadout } from "./loadout.ts";
 import { snapshotContext } from "./context.ts";
 import { TaskStore, bounded, toolHistory } from "./store.ts";
@@ -58,7 +58,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!ctx.sessionManager.getSessionFile()) return;
     const display = new TaskWidget();
     ctxForWidget = ctx;
-    const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
+    // Host imports are mapped by Pi's loader; native module resolution cannot locate them.
+    const packageDir = getPackageDir();
+    const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));
+    const cli = join(packageDir, manifest.bin.pi);
     const dir = join(ctx.sessionManager.getSessionDir(), "rpc-subagents", ctx.sessionManager.getSessionId());
     manager = new TaskManager(new TaskStore(dir), {
       maxConcurrent: Number(process.env.PI_SUBAGENT_MAX_CONCURRENT ?? 8),
