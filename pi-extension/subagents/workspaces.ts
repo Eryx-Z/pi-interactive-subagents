@@ -5,7 +5,7 @@ import { resolve, relative, join, isAbsolute, dirname, basename, sep } from "nod
 
 const exec = promisify(execFile);
 export interface Isolation { repo: string; base: string; directory: string; relativeCwd: string }
-export interface Worktree { path: string; input?: string; output?: string }
+export interface Worktree { path: string; input?: string; output?: string; revisionRef?: string; removed?: boolean }
 export async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await exec("git", ["-c", "core.hooksPath=/dev/null", "-c", "user.name=Pi workflow", "-c", "user.email=pi-workflow@localhost", "-c", "commit.gpgsign=false", "-c", "merge.gpgsign=false", ...args], { cwd, timeout: 60_000, maxBuffer: 8 * 1024 * 1024, env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))), GIT_TERMINAL_PROMPT: "0" } });
   return result.stdout.trim();
@@ -40,6 +40,57 @@ export async function prepare(isolation: Isolation, tree: Worktree, revisions: s
   for (const revision of revisions) await git(tree.path, "merge", "--no-edit", "--no-ff", revision);
   tree.input = await git(tree.path, "rev-parse", "HEAD");
   return join(tree.path, isolation.relativeCwd);
+}
+/** Keep a successful captured commit reachable even after its worktree is removed and Git runs GC. */
+export async function retain(repo: string, ref: string, revision: string): Promise<void> {
+  await git(repo, "check-ref-format", ref);
+  const commit = await git(repo, "rev-parse", "--verify", "--end-of-options", `${revision}^{commit}`);
+  await git(repo, "update-ref", ref, commit);
+}
+function canonicalPath(path: string): string {
+  try { return realpathSync(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const parent = dirname(path);
+    if (parent === path) throw error;
+    return join(canonicalPath(parent), basename(path));
+  }
+}
+function strictlyInside(directory: string, path: string): boolean {
+  const child = relative(directory, path);
+  return !!child && child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child);
+}
+/** Caller must confirm all worktree processes stopped first. Never captures discarded changes. */
+export async function remove(isolation: Isolation, tree: Worktree): Promise<void> {
+  const path = resolve(tree.path);
+  const directory = resolve(isolation.directory);
+  const actualPath = canonicalPath(path);
+  const repo = realpathSync(isolation.repo);
+  if (!strictlyInside(directory, path) || !strictlyInside(canonicalPath(directory), actualPath) || actualPath === repo) {
+    throw new Error(`Refusing unmanaged worktree removal: ${tree.path}`);
+  }
+  // NUL-delimited porcelain handles spaces/newlines without interpreting Git's quoting.
+  const entries = (await git(repo, "worktree", "list", "--porcelain", "-z")).split("\0\0");
+  const entry = entries.map(value => value.split("\0")).find(fields =>
+    fields[0]?.startsWith("worktree ") && canonicalPath(fields[0].slice(9)) === actualPath);
+  if (!entry) {
+    if (!existsSync(path)) return; // Already removed; do not prune unrelated registrations.
+    throw new Error(`Refusing unregistered worktree removal: ${tree.path}`);
+  }
+  if (!entry.includes("detached") || entry.some(field => field === "locked" || field.startsWith("locked "))) {
+    throw new Error(`Worktree must remain detached and unlocked: ${tree.path}`);
+  }
+  if (existsSync(path)) {
+    const common = realpathSync(await git(path, "rev-parse", "--path-format=absolute", "--git-common-dir"));
+    const expected = realpathSync(await git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"));
+    if (common !== expected || realpathSync(await git(path, "rev-parse", "--show-toplevel")) !== actualPath) {
+      throw new Error(`Unexpected worktree: ${tree.path}`);
+    }
+    if (await git(path, "rev-parse", "--abbrev-ref", "HEAD") !== "HEAD") throw new Error(`Worktree must remain detached: ${tree.path}`);
+  }
+  // A single --force discards dirty/conflicted files, but cannot override a worktree lock.
+  // Git also removes just this registration when its directory is already absent.
+  await git(repo, "worktree", "remove", "--force", "--", path);
 }
 export async function capture(tree: Worktree): Promise<string> {
   if (!tree.input) throw new Error("Missing worktree input revision");

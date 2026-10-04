@@ -1,6 +1,9 @@
 import { test } from "node:test";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import assert from "node:assert/strict";
-import { taskMenu, widget, resultRenderer, TaskWidget, clean, detail, taskSummary } from "../pi-extension/subagents/ui.ts";
+import { taskMenu, widget, resultRenderer, TaskWidget, clean, detail, taskSummary, createDashboardContent } from "../pi-extension/subagents/ui.ts";
 import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 function setup() {
@@ -228,6 +231,90 @@ test("RPC menu preserves task and question IDs as the first token", async () => 
   await taskMenu(t.manager, t.ctx, "task-id");
   assert.equal(t.dialogs.at(-1)[1][0], "q-id ? Which interface?");
   assert.deepEqual(t.calls.at(-1), ["answer", "task-id", "q-id", "extra requirement"]);
+});
+
+test("details show the saved model, thinking level and complete parent task prompt", () => {
+  const t = setup();
+  t.record.loadout.model = "provider/child-model";
+  t.record.loadout.thinking = "high";
+  t.record.task = "Parent instruction:\n" + "完整任务说明\n".repeat(2000) + "PROMPT_END";
+  for (const live of [false, true]) {
+    const text = detail(t.record, live);
+    assert.match(text, /Model: provider\/child-model · Thinking: high/);
+    assert.ok(text.includes("── Task · Parent prompt ──"));
+    assert.ok(text.includes(t.record.task), "parent task must not be truncated");
+  }
+});
+
+test("Trace preserves complete session records and caches only the selected file per interaction", context => {
+  const dir = mkdtempSync(join(tmpdir(), "subagents-trace-"));
+  const t = setup();
+  t.record.sessionFile = join(dir, "child.jsonl");
+  const long = "完整参数\n".repeat(2000) + "ARGUMENT_END";
+  const entries = [
+    { type: "session", id: "child", inherited: true },
+    { type: "message", message: { role: "assistant", content: [
+      { type: "thinking", thinking: "emitted thinking\nsecond line" },
+      { type: "text", text: "first\nsecond" },
+      { type: "toolCall", id: "call", name: "write", arguments: { content: long } },
+    ] } },
+    { type: "message", message: { role: "toolResult", toolCallId: "call", content: [{ type: "text", text: long + "RESULT_END" }] } },
+    { type: "custom", data: "\x1b]0;evil\x07VISIBLE\x00" },
+  ];
+  writeFileSync(t.record.sessionFile, entries.map(entry => JSON.stringify(entry)).join("\n") + "\n");
+  const otherPath = join(dir, "other.jsonl");
+  writeFileSync(otherPath, JSON.stringify({ type: "other", text: "OTHER_TRACE" }) + "\n");
+  let parses = 0;
+  const parse = JSON.parse;
+  context.mock.method(JSON, "parse", (...args: Parameters<typeof JSON.parse>) => { parses++; return parse(...args); });
+  try {
+    const content = createDashboardContent();
+    content.detail(t.record, "overview"); content.detail(t.record, "prompt"); content.detail(t.record, "activity");
+    assert.equal(parses, 0, "non-Trace views never load transcripts");
+    const text = content.detail(t.record, "trace");
+    assert.match(text, /inherited context.*not hidden reasoning/);
+    for (const entry of entries.slice(0, 3)) assert.ok(text.includes(JSON.stringify(entry, null, 2)), "no record fields or long values are truncated");
+    assert.match(text, /VISIBLE/); assert.doesNotMatch(text, /evil|\\u001b|\\u0000|\x1b|\x00/);
+    assert.equal(parses, entries.length);
+    assert.equal(content.detail(t.record, "trace"), text);
+    assert.equal(parses, entries.length, "unchanged contents are not reparsed");
+    assert.equal(createDashboardContent().detail(t.record, "trace"), text);
+    assert.equal(parses, entries.length * 2, "new interactions own a fresh cache");
+    assert.match(content.detail({ ...t.record, sessionFile: otherPath }, "trace"), /OTHER_TRACE/);
+    assert.equal(parses, entries.length * 2 + 1);
+    content.detail(t.record, "trace");
+    assert.equal(parses, entries.length * 3 + 1, "switching paths replaces the single cached file");
+    appendFileSync(t.record.sessionFile, JSON.stringify({ type: "message", text: "APPENDED_RECORD" }) + "\n");
+    assert.match(content.detail(t.record, "trace"), /APPENDED_RECORD/);
+    assert.equal(parses, entries.length * 4 + 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Trace recovers from missing/unreadable files and retains malformed or partial JSONL", () => {
+  const dir = mkdtempSync(join(tmpdir(), "subagents-trace-errors-"));
+  const t = setup(), content = createDashboardContent();
+  t.record.sessionFile = join(dir, "child.jsonl");
+  try {
+    assert.match(content.detail(t.record, "trace"), /No session transcript yet/);
+    assert.match(content.detail({ ...t.record, sessionFile: dir }, "trace"), /Cannot read session transcript/);
+    writeFileSync(t.record.sessionFile, "");
+    assert.match(content.detail(t.record, "trace"), /No session records yet/);
+    writeFileSync(t.record.sessionFile, JSON.stringify({ text: "VALID" }) + '\n{broken}\n{"text":"PARTIAL');
+    let text = content.detail(t.record, "trace");
+    assert.match(text, /VALID/);
+    assert.match(text, /Invalid or incomplete JSONL line 2 · raw/);
+    assert.match(text, /\{broken\}/);
+    assert.match(text, /Invalid or incomplete JSONL line 3 · raw/);
+    assert.ok(text.includes('{"text":"PARTIAL'));
+    appendFileSync(t.record.sessionFile, '_COMPLETE"}\n');
+    text = content.detail(t.record, "trace");
+    assert.match(text, /PARTIAL_COMPLETE/);
+    assert.doesNotMatch(text, /Invalid or incomplete JSONL line 3/);
+    appendFileSync(t.record.sessionFile, '{"text":"\x1b]0;raw-evil\x07SAFE_PARTIAL');
+    text = content.detail(t.record, "trace");
+    assert.match(text, /SAFE_PARTIAL/);
+    assert.doesNotMatch(text, /raw-evil|\x1b|\x07/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("snapshots have explicit sections and sanitize terminal controls", () => {

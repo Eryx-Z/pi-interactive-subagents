@@ -1,6 +1,6 @@
 // Local deterministic provider and file-backed tools. No network or real model quota.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentTools, getCurrentSystemPrompt, type AssistantMessage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
 export default function inheritedTools(pi: ExtensionAPI) {
@@ -34,7 +34,7 @@ export default function inheritedTools(pi: ExtensionAPI) {
       } else if (process.env.PI_RPC_SUBAGENT_CHILD === "1" && input.includes("Assigned task:\nASK")) {
         content.push({ type: "toolCall", id: "question", name: "ask_question", arguments: { question: "Which implementation?" } });
       } else {
-        content.push({ type: "text", text: JSON.stringify({ tools: context.tools?.map(t => t.name), systemPrompt: context.systemPrompt, last }) });
+        content.push({ type: "text", text: JSON.stringify({ tools: getCurrentTools(context.messages).map(t => t.name), systemPrompt: getCurrentSystemPrompt(context.messages), last }) });
       }
       const message: AssistantMessage = { role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },

@@ -4,7 +4,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 
 export default function builtinProvider(pi: ExtensionAPI) {
-  pi.events.on("rpc-subagents:provider-source:v1", (request: { provider: string; register: (path: string) => void }) => {
+  pi.events.on("rpc-subagents:provider-source:v1", (data) => {
+    if (!data || typeof data !== "object" || !("provider" in data) || !("register" in data)) return;
+    const request = data;
+    if (typeof request.register !== "function") return;
     if (request.provider === "builtin-fixture") request.register(fileURLToPath(import.meta.url));
   });
   pi.registerProvider("builtin-fixture", {

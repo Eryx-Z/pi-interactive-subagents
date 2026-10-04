@@ -87,7 +87,13 @@ export class RpcProcess extends EventEmitter {
       if (this.promptPreflights.has(event.id)) throw new Error("Duplicate unresolved prompt ID");
       this.promptPreflights.add(event.id);
     }
-    this.child.stdin.write(line);
+    try { this.child.stdin.write(line); }
+    catch (error) {
+      // A synchronous write failure did not submit this prompt. Asynchronous
+      // stream errors still leave acceptance unknown and must retain tracking.
+      if (event.type === "prompt") this.promptPreflights.delete(event.id);
+      throw error;
+    }
   }
   request(type: string, fields: Record<string, unknown> = {}): Promise<any> {
     if (this.closed || this.stopping) return Promise.reject(new Error("RPC process is stopping"));
@@ -122,15 +128,23 @@ export class RpcProcess extends EventEmitter {
   private async waitForPromptPreflights(): Promise<void> {
     if (!this.promptPreflights.size) return;
     if (this.closed) throw new Error("Prompt acceptance is unknown after child exit");
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.preflightsDrained = undefined;
-        reject(new Error("Prompt preflight did not settle; acceptance remains unknown"));
-      }, this.graceMs);
-      this.preflightsDrained = () => {
-        clearTimeout(timer); this.preflightsDrained = undefined; resolve();
-      };
-    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        new Promise<void>((resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error("Prompt preflight did not settle; acceptance remains unknown"));
+          }, this.graceMs);
+          this.preflightsDrained = resolve;
+        }),
+        this.exitPromise.then(() => {
+          throw new Error("Prompt acceptance is unknown after child exit");
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      this.preflightsDrained = undefined;
+    }
   }
   private async stopProcess(): Promise<void> {
     this.rejectPending(new Error("RPC process stopping"));

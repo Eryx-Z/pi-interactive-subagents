@@ -10,7 +10,7 @@ export interface TaskRecord {
   version: 1 | 2; id: string; name: string; task: string; context: ContextMode;
   /** Legacy ownership is retained for inspection only; never inferred as access. */
   ownership?: string; access?: AccessMode; availableLoadout?: Loadout;
-  workflow?: { id: string; stepId: string };
+  workflow?: { id: string; stepId: string; attemptId?: string };
   state: TaskState; startedAt: number; updatedAt: number; sessionFile: string;
   loadout: Loadout; output: string; activity: string; log: string[]; questions: Question[];
   error?: string; stopped: boolean; run: number;

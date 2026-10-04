@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WorkflowManager, type StepDefinition } from '../pi-extension/subagents/workflows.ts';
+import { WorkflowManager, workflowSummary, type StepDefinition } from '../pi-extension/subagents/workflows.ts';
 import { TaskManager } from '../pi-extension/subagents/tasks.ts';
 import { TaskStore } from '../pi-extension/subagents/store.ts';
 import { RpcProcess } from '../pi-extension/subagents/rpc.ts';
@@ -39,7 +39,10 @@ test('isolated writers overlap; dependency code propagates; final validation lea
     await until(() => r.state === 'completed');
     assert.equal(r.validated, true); assert.ok(r.integration?.output);
     assert.equal(await git(t.repo, 'rev-parse', 'HEAD'), base); assert.equal(await git(t.repo, 'status', '--porcelain'), '');
-    assert.equal(readFileSync(join(r.integration!.path, 'joined.txt'), 'utf8'), 'joined');
+    await until(() => !!r.integration?.removed);
+    assert.equal(existsSync(r.integration!.path), false);
+    assert.equal(await git(t.repo, 'show', `${r.integration!.revisionRef}:joined.txt`), 'joined');
+    assert.ok(r.steps.every(s => s.worktree?.removed && s.worktree.revisionRef));
   } finally { await t.clean(); }
 });
 test('conflicting final integration pauses, preserves conflicts, and resumes after explicit resolution', async () => {
@@ -60,6 +63,7 @@ test('dependency merge conflict prevents downstream launch until explicit repair
     const r = t.launch([step('a'), step('b'), step('join', ['a', 'b'])]); await Promise.all(r.steps.slice(0, 2).map(s => t.ready(s)));
     for (const s of r.steps.slice(0, 2)) { writeFileSync(join(s.worktree!.path, 'base.txt'), `${s.id}\n`); await t.finish(s); }
     await until(() => r.state === 'paused'); const downstream = r.steps[2]; assert.equal(downstream.state, 'failed'); assert.equal(downstream.taskId, undefined);
+    assert.ok(workflowSummary(r).includes(`worktree=${downstream.worktree!.path}`), 'inspection must report the conflicted worktree before a child exists');
     writeFileSync(join(downstream.worktree!.path, 'base.txt'), 'resolved\n'); await git(downstream.worktree!.path, 'add', '.'); await git(downstream.worktree!.path, 'commit', '-m', 'resolve');
     await t.workflows.retry(r.id, 'join', 'Continue with resolved inputs'); t.workflows.resume(r.id); await t.ready(downstream); await t.finish(downstream);
     // Integrating all steps in declaration order would conflict before reaching the
@@ -96,7 +100,12 @@ test('successful siblings are captured while paused so a failed step can be retr
     const r = t.launch([step('good'), { ...step('bad'), task: 'SCENARIO_ERROR' }]);
     await t.ready(r.steps[0]); await until(() => r.state === 'paused'); await t.finish(r.steps[0]);
     await until(() => r.steps[0].state === 'completed' && r.steps[1].state === 'failed');
-    await t.workflows.retry(r.id, 'bad', 'Fix it'); t.workflows.resume(r.id); await until(() => r.state === 'completed');
+    const oldId = r.steps[1].taskId!, oldCwd = t.tasks.get(oldId).loadout.cwd;
+    await t.workflows.retry(r.id, 'bad', 'Fix it SCENARIO_HOLD'); t.workflows.resume(r.id);
+    await t.ready(r.steps[1]); assert.notEqual(r.steps[1].taskId, oldId);
+    assert.notEqual(t.tasks.get(r.steps[1].taskId!).loadout.cwd, oldCwd);
+    assert.equal(existsSync(oldCwd), false); await t.finish(r.steps[1]);
+    await until(() => r.state === 'completed' && !!r.integration?.removed);
     assert.ok(r.steps[0].worktree?.output);
   } finally { await t.clean(); }
 });

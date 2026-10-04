@@ -9,7 +9,7 @@ import { diagnoseFailure } from "./diagnostics.ts";
 
 export interface NewTask {
   name?: string; task: string; access: AccessMode; context: ContextMode; contextText?: string;
-  workflow?: { id: string; stepId: string };
+  workflow?: { id: string; stepId: string; attemptId?: string };
   loadout: Loadout; snapshot?: AgentMessage[]; parentSession?: string;
 }
 interface LiveRun {

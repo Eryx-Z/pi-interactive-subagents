@@ -15,7 +15,8 @@ import { closeDashboards } from "./dashboard.ts";
 const result = (text: string) => ({ content: [{ type: "text" as const, text: bounded(text, 16000) }], details: {} });
 const accessSchema = () => StringEnum(["read-only", "full"] as const);
 const contextFields = {
-  context: Type.Optional(StringEnum(["none", "partial", "full"] as const)), contextText: Type.Optional(Type.String()),
+  context: Type.Optional(StringEnum(["none", "partial", "full"] as const, { description: "Parent context mode: partial (default) requires contextText; none shares no parent history; full freezes the active branch." })),
+  contextText: Type.Optional(Type.String({ description: "Selected parent context, required for partial mode (including when context is omitted); only supported in partial mode. Use context=none for an independent task." })),
   name: Type.Optional(Type.String()), model: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()),
 };
 const stepSchema = Type.Object({
@@ -152,8 +153,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
   pi.registerTool({
     name: "workflow_control", label: "Workflow control",
-    description: "List/inspect workflows, pause future scheduling (active steps continue), resume, cancel, upsert pending steps while paused, or explicitly retry/continue a finished step in its original session. Retry requires a paused workflow, no active steps in that workflow and no started descendants; it does not automatically resume scheduling. Use subagent_control for child history, messages and question answers. Recovery never auto-resumes orphan writers.",
-    parameters: Type.Object({ action: StringEnum(["list", "inspect", "pause", "resume", "cancel", "update", "retry"] as const), id: Type.Optional(Type.String()),
+    description: "List/inspect workflows, pause future scheduling (active steps continue), resume, cancel, upsert pending steps while paused, retry a finished step (shared workspace continues its session; isolated workspace discards the old scene and starts a fresh task on resume), or retry terminal worktree cleanup. Retry requires a paused workflow, no active steps in that workflow and no started descendants; it does not automatically resume scheduling. Use subagent_control for child history, messages and question answers. Completed/cancelled isolated workflows pin successful Git outputs under refs/pi-workflows before deleting all owned worktrees, discarding uncommitted/conflicted scenes; sessions/logs remain. Cleanup refuses live or unconfirmed processes. Recovery never auto-resumes orphan writers.",
+    parameters: Type.Object({ action: StringEnum(["list", "inspect", "pause", "resume", "cancel", "update", "retry", "cleanup"] as const), id: Type.Optional(Type.String()),
       steps: Type.Optional(Type.Array(stepSchema, { minItems: 1, maxItems: 64 })), stepId: Type.Optional(Type.String()),
       message: Type.Optional(Type.String()), access: Type.Optional(accessSchema()),
     }, { additionalProperties: false }),
@@ -164,6 +165,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       if (p.action === "pause") w.pause(id);
       else if (p.action === "resume") w.resume(id);
       else if (p.action === "cancel") await w.cancel(id);
+      else if (p.action === "cleanup") await w.cleanup(id);
       else if (p.action === "update") { if (!p.steps) throw new Error("steps required"); w.update(id, p.steps); }
       else if (p.action === "retry") {
         await w.retry(id, nonempty(p.stepId, "stepId"), nonempty(p.message, "message"), p.access);

@@ -1,9 +1,11 @@
 import { test } from "node:test";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { RpcProcess, JsonlDecoder } from "../pi-extension/subagents/rpc.ts";
 const fixture = fileURLToPath(new URL("./fixtures/fake-rpc.mjs", import.meta.url));
-const rpc = (timeout = 1000) => new RpcProcess({ command: process.execPath, args: [fixture], cwd: process.cwd() }, timeout, 25);
+// Protocol tests must not mistake parallel-suite scheduling delays for failed cleanup.
+const rpc = (timeout = 5000) => new RpcProcess({ command: process.execPath, args: [fixture], cwd: process.cwd() }, timeout, 250);
 
 test("JSONL preserves chunked UTF8, CRLF, Unicode separators and rejects oversized/malformed frames", () => {
   const events: any[] = []; const d = new JsonlDecoder(e => events.push(e));
@@ -23,7 +25,8 @@ test("RPC requests correlate out-of-order responses and reject failed/mismatched
   } finally { await r.stop(); }
 });
 test("RPC timeout is explicit and stops the child, rejecting outstanding requests", async () => {
-  const r = rpc(1000);
+  // Include process startup headroom when the full suite runs in parallel.
+  const r = rpc(5000);
   await r.request("get_state");
   await assert.rejects(r.request("never"), /unknown/);
   await r.stop();
@@ -157,6 +160,65 @@ test('mismatched prompt receipts do not erase unknown acceptance', async () => {
     await r.request('get_state');
     await assert.rejects(r.request('prompt', { message: 'wrong receipt', receiptDelay: 10, wrongCommand: true }), /mismatch/);
     await assert.rejects(r.stop(), /Prompt preflight did not settle/);
+    assert.equal(events.some(e => e.type === 'eof' || e.type === 'cleanup_command'), false);
+  } finally { await r.stop().catch(() => {}); }
+});
+
+test('synchronous stdin write failure does not leave a phantom prompt preflight', async () => {
+  const r = rpc();
+  const child = (r as unknown as { child: ChildProcessWithoutNullStreams }).child;
+  let closed = false;
+  r.on('closed', () => { closed = true; });
+  await r.request('get_state');
+  const write = child.stdin.write;
+  child.stdin.write = () => { throw new Error('synchronous write failure'); };
+  try {
+    assert.throws(() => r.send({ type: 'prompt', id: 'failed-send', message: 'not sent' }), /synchronous write failure/);
+    await assert.rejects(r.request('prompt', { message: 'not sent either' }), /synchronous write failure/);
+  } finally { child.stdin.write = write; }
+  await r.stop();
+  assert.equal(closed, true, 'successful stop must observe child closure');
+});
+
+test('stdin backpressure and asynchronous errors retain unknown prompt acceptance', async () => {
+  const { process: r, events } = preflightRpc();
+  const child = (r as unknown as { child: ChildProcessWithoutNullStreams }).child;
+  let closed = false;
+  r.on('closed', () => { closed = true; });
+  try {
+    await r.request('get_state');
+    const write = child.stdin.write;
+    // A false return is backpressure, not a synchronous submission failure.
+    child.stdin.write = () => false;
+    try { r.send({ type: 'prompt', message: 'possibly submitted' }); }
+    finally { child.stdin.write = write; }
+    child.stdin.emit('error', new Error('asynchronous stream failure'));
+    await assert.rejects(r.stop(), /without confirmed agent\/tool cleanup.*Prompt preflight did not settle/);
+    assert.equal(closed, true, 'failed cleanup still waits for child closure');
+    assert.equal(events.some(e => e.type === 'eof' || e.type === 'cleanup_command'), false);
+  } finally { await r.stop().catch(() => {}); }
+});
+
+test('child closure interrupts preflight wait promptly without confirming cleanup', async () => {
+  const { process: r, events } = preflightRpc(1000, 5000);
+  const child = (r as unknown as { child: ChildProcessWithoutNullStreams }).child;
+  try {
+    await r.request('get_state');
+    r.send({ type: 'prompt', message: 'unresolved on exit' });
+    await waitForPreflight(events);
+    const stopping = r.stop();
+    // Let stop enter its preflight wait before the process closes.
+    await new Promise(resolve => setImmediate(resolve));
+    const closed = new Promise<void>(resolve => r.once('closed', () => resolve()));
+    child.kill('SIGKILL');
+    await closed;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        assert.rejects(stopping, /without confirmed agent\/tool cleanup.*acceptance is unknown after child exit/),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('stop waited for preflight grace after child closure')), 1000); }),
+      ]);
+    } finally { clearTimeout(timer); }
     assert.equal(events.some(e => e.type === 'eof' || e.type === 'cleanup_command'), false);
   } finally { await r.stop().catch(() => {}); }
 });

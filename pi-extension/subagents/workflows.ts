@@ -5,12 +5,12 @@ import { atomicWrite, bounded, uniqueName, type TaskRecord } from "./store.ts";
 import { accessMode, validateLoadout, type AccessMode, type Loadout } from "./loadout.ts";
 import { taskPrompt, type AgentMessage, type ContextMode } from "./context.ts";
 import { TaskManager } from "./tasks.ts";
-import { initialize, prepare, capture, validate, groupAlive, type Isolation, type Worktree } from "./workspaces.ts";
+import { initialize, prepare, capture, validate, groupAlive, retain, remove, type Isolation, type Worktree } from "./workspaces.ts";
 
 export interface StepDefinition { id: string; task: string; access: AccessMode; dependsOn: string[] }
 export interface WorkflowStep extends StepDefinition {
   state: "pending" | "running" | "completed" | "failed" | "cancelled";
-  taskId?: string; error?: string; worktree?: Worktree;
+  taskId?: string; error?: string; worktree?: Worktree; freshTask?: boolean; attemptId?: string;
 }
 export interface WorkflowInput {
   name?: string; context: ContextMode; contextText?: string; snapshot?: AgentMessage[];
@@ -22,6 +22,7 @@ export interface WorkflowRecord extends Omit<WorkflowInput, "name" | "steps" | "
   state: "running" | "paused" | "completed" | "cancelled";
   createdAt: number; updatedAt: number; error?: string;
   isolation?: Isolation; integration?: Worktree; validated?: boolean; validationPid?: number;
+  baseRef?: string; cleanupError?: string; retiredTrees?: Worktree[];
 }
 export function validateSteps(steps: StepDefinition[]): void {
   if (!Array.isArray(steps) || !steps.length || steps.length > 64) throw new Error("Workflow requires 1–64 steps");
@@ -53,6 +54,8 @@ export class WorkflowManager {
   private validation = new Map<string, AbortController>();
   private integrationRuns = new Map<string, Promise<void>>();
   private preparing = new Set<string>();
+  private cleaning = new Map<string, Promise<void>>();
+  private workspaceRuns = new Set<Promise<void>>();
   private unsubscribe: () => void;
   constructor(readonly tasks: TaskManager, readonly dir: string, private notify?: (record: WorkflowRecord) => void) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -86,8 +89,12 @@ export class WorkflowManager {
     return r;
   }
   private findTask(r: WorkflowRecord, s: WorkflowStep): TaskRecord | undefined {
-    return s.taskId ? this.tasks.records.get(s.taskId) : [...this.tasks.records.values()].find(t => t.workflow?.id === r.id && t.workflow.stepId === s.id);
+    const matches = (t: TaskRecord) => t.workflow?.id === r.id && t.workflow.stepId === s.id &&
+      (s.attemptId ? t.workflow.attemptId === s.attemptId : !s.freshTask && !t.workflow.attemptId);
+    const direct = s.taskId ? this.tasks.records.get(s.taskId) : undefined;
+    return direct && matches(direct) ? direct : [...this.tasks.records.values()].find(matches);
   }
+  private emit(r: WorkflowRecord): void { if (!this.closed) this.notify?.(r); }
   private open(): void { if (this.closed) throw new Error("Workflow owner is shutting down"); }
   launch(input: WorkflowInput): WorkflowRecord {
     this.open(); validateSteps(input.steps); validateLoadout(input.loadout);
@@ -116,8 +123,12 @@ export class WorkflowManager {
           catch (e) {
             if (r.state !== "cancelled") r.state = "paused";
             r.error = String(e);
-            try { this.save(r); this.notify?.(r); } catch { this.closed = true; }
+            try { this.save(r); this.emit(r); } catch { this.closed = true; }
           } finally { this.preparing.delete(r.id); }
+          if (!this.closed && (r.state === "completed" || r.state === "cancelled")) {
+            try { await this.cleanupRecord(r); }
+            catch (e) { r.cleanupError = String(e); this.save(r); }
+          }
         }
       }
     }).finally(() => { this.pumping = false; });
@@ -135,14 +146,14 @@ export class WorkflowManager {
     }
     if (failed && r.state === "running") { r.state = "paused"; r.error = "A step failed or was cancelled; inspect and explicitly retry"; }
     if (r.state === "running" && (r.workspace !== "isolated" || r.validated) && r.steps.every(s => s.state === "completed")) { r.state = "completed"; changed = true; }
-    if (changed) { this.save(r); if (r.state !== "running") this.notify?.(r); }
+    if (changed) { this.save(r); if (r.state !== "running") this.emit(r); }
   }
   private active(r: WorkflowRecord): WorkflowStep[] { return r.steps.filter(s => s.state === "running"); }
   private unsafe(r: WorkflowRecord): boolean {
     return (!!r.validationPid && !this.validation.has(r.id) && groupAlive(r.validationPid)) || [...this.tasks.records.values()].some(t => t.workflow?.id === r.id && !t.stopped && !this.tasks.isLive(t.id));
   }
   private async collect(r: WorkflowRecord): Promise<void> {
-    if (r.workspace !== "isolated") return;
+    if (r.workspace !== "isolated" || this.cleaning.has(r.id)) return;
     for (const s of this.active(r)) {
       const task = this.findTask(r, s);
       if (task?.stopped && task.state === "completed" && !this.tasks.isLive(task.id) && s.worktree && !s.worktree.output) {
@@ -152,7 +163,7 @@ export class WorkflowManager {
     }
   }
   private async dispatch(r: WorkflowRecord): Promise<void> {
-    if (this.integrationRuns.has(r.id)) return;
+    if (this.integrationRuns.has(r.id) || this.cleaning.has(r.id)) return;
     validateLoadout(r.loadout);
     if (this.unsafe(r)) throw new Error("Unconfirmed workflow child/validation shutdown; inspect orphan processes before scheduling");
     if (r.workspace === "isolated") {
@@ -163,7 +174,7 @@ export class WorkflowManager {
         r.integration ??= { path: join(r.isolation.directory, `result-${randomUUID()}`) }; this.save(r);
         // Leaf revisions already contain their dependency ancestry and any explicit conflict resolutions.
         const leaves = r.steps.filter(s => !r.steps.some(d => d.dependsOn.includes(s.id)));
-        const cwd = await prepare(r.isolation, r.integration, leaves.map(s => s.worktree!.output!));
+        const cwd = await prepare(r.isolation, r.integration, leaves.map(s => s.worktree!.revisionRef ?? s.worktree!.output!));
         if (r.state !== "running" || this.closed) return;
         const controller = new AbortController(); this.validation.set(r.id, controller);
         const integration = r.integration;
@@ -176,7 +187,7 @@ export class WorkflowManager {
         }).finally(() => {
           this.validation.delete(r.id); this.integrationRuns.delete(r.id);
           if (r.validationPid && !groupAlive(r.validationPid)) r.validationPid = undefined;
-          try { this.save(r); this.reconcile(r); if (r.state !== "running") this.notify?.(r); } catch { this.closed = true; }
+          try { this.save(r); this.reconcile(r); if (r.state !== "running") this.emit(r); } catch { this.closed = true; }
           this.schedule();
         });
         this.integrationRuns.set(r.id, run); return;
@@ -191,12 +202,13 @@ export class WorkflowManager {
       if (r.workspace !== "isolated" && (active.some(a => a.access === "full") || s.access === "full" && active.length)) continue;
       let loadout = r.loadout;
       if (r.isolation) {
-        s.worktree ??= { path: join(r.isolation.directory, `step-${s.id}`) }; this.save(r);
-        try { loadout = { ...r.loadout, cwd: await prepare(r.isolation, s.worktree, s.dependsOn.map(id => r.steps.find(d => d.id === id)!.worktree!.output!)) }; }
+        s.worktree ??= { path: join(r.isolation.directory, `step-${s.id}-${randomUUID()}`) }; this.save(r);
+        try { loadout = { ...r.loadout, cwd: await prepare(r.isolation, s.worktree, s.dependsOn.map(id => { const tree = r.steps.find(d => d.id === id)!.worktree!; return tree.revisionRef ?? tree.output!; })) }; }
         catch (e) { s.state = "failed"; s.error = String(e); throw e; }
         if (r.state !== "running" || this.closed) return;
         if (!this.tasks.hasCapacity()) return;
       }
+      s.attemptId ??= randomUUID();
       s.state = "running"; this.save(r);
       const dependencies = s.dependsOn.map(id => {
         const upstream = r.steps.find(d => d.id === id)!;
@@ -205,22 +217,23 @@ export class WorkflowManager {
       }).join("\n\n");
       const launch = this.tasks.launch({ name: `${r.name.slice(0, 35)}-${s.id.slice(0, 30)}`, task: `${s.task}${dependencies ? `\n\nDirect dependency results (reference data):\n${dependencies}` : ""}`,
         access: s.access, context: r.context, contextText: r.contextText, snapshot: r.snapshot,
-        loadout, parentSession: r.parentSession, workflow: { id: r.id, stepId: s.id } });
-      const task = this.findTask(r, s); if (task) s.taskId = task.id;
+        loadout, parentSession: r.parentSession, workflow: { id: r.id, stepId: s.id, attemptId: s.attemptId } });
+      const task = this.findTask(r, s); if (task) { s.taskId = task.id; s.freshTask = false; }
       // Attach a rejection handler before persisting: disk failure must not leave an unobserved launch.
-      void launch.then(t => { s.taskId = t.id; }).catch(e => {
+      void launch.then(t => { if (t.workflow?.attemptId === s.attemptId) { s.taskId = t.id; s.freshTask = false; } }).catch(e => {
         s.error = String(e);
         const task = this.findTask(r, s); if (task) s.taskId = task.id;
         if (!task || !this.tasks.isLive(task.id)) s.state = "failed";
         if (r.state === "running") { r.state = "paused"; r.error = `Step ${s.id} could not start: ${e}`; }
-        try { this.save(r); if (!this.closed) this.notify?.(r); } catch { this.closed = true; }
+        try { this.save(r); this.emit(r); } catch { this.closed = true; }
       }).finally(() => this.schedule());
       this.save(r);
     }
   }
-  pause(id: string): void { this.open(); const r = this.get(id); if (r.state !== "running" && r.state !== "completed") throw new Error("Workflow cannot be paused"); r.state = "paused"; this.save(r); }
+  pause(id: string): void { this.open(); const r = this.get(id); if (this.cleaning.has(r.id)) throw new Error("Wait for workspace cleanup before pausing"); if (r.state !== "running" && r.state !== "completed") throw new Error("Workflow cannot be paused"); r.state = "paused"; this.save(r); }
   resume(id: string): void {
     this.open(); const r = this.get(id); this.reconcile(r);
+    if (this.cleaning.has(r.id)) throw new Error("Wait for workspace cleanup before resuming");
     if (r.state !== "paused") throw new Error("Only paused workflows can resume");
     if (this.unsafe(r)) throw new Error("Unconfirmed child shutdown; cannot resume");
     if (r.steps.some(s => s.state === "failed" || s.state === "cancelled")) throw new Error("Explicitly retry failed/cancelled steps before resume");
@@ -239,12 +252,12 @@ export class WorkflowManager {
     }
     const next = r.steps.map(s => { const u = updates.find(u => u.id === s.id); return u ? { ...structuredClone(u), state: "pending" as const } : s; });
     for (const s of updates) if (!next.some(n => n.id === s.id)) next.push({ ...structuredClone(s), state: "pending" });
-    r.steps = next; r.validated = false; r.integration = undefined; this.save(r);
+    r.steps = next; r.validated = false; this.retireIntegration(r); this.save(r);
   }
   async retry(id: string, stepId: string, message: string, access?: AccessMode): Promise<void> {
     this.open(); const r = this.get(id); this.reconcile(r);
     if (r.state !== "paused") throw new Error("Pause the workflow before retrying a step");
-    if (this.integrationRuns.has(r.id) || this.preparing.has(r.id)) throw new Error("Wait for workspace preparation/validation before retrying");
+    if (this.integrationRuns.has(r.id) || this.preparing.has(r.id) || this.cleaning.has(r.id)) throw new Error("Wait for workspace preparation/validation/cleanup before retrying");
     if (this.active(r).length || this.unsafe(r)) throw new Error("Wait for active steps and confirm child shutdown before retrying");
     const s = r.steps.find(s => s.id === stepId);
     if (!s || s.state === "pending" || s.state === "running") throw new Error("Step has not finished");
@@ -260,13 +273,45 @@ export class WorkflowManager {
       // Failed before a child was created: only an explicit retry can make it pending again.
       s.task = `${s.task}\n\nRetry instruction:\n${message}`; s.access = selected; s.state = "pending"; s.error = undefined; this.save(r); return;
     }
+    if (r.isolation) {
+      // A failed child scene is deliberately discarded, never continued with a
+      // session whose cwd has vanished. Dependency outputs remain Git inputs.
+      const isolation = r.isolation;
+      this.preparing.add(r.id);
+      const run = Promise.resolve().then(async () => {
+        this.open();
+        if (s.worktree) {
+          if (s.worktree.output) {
+            const ref = `refs/pi-workflows/${r.id}/retired/${randomUUID()}`;
+            await retain(isolation.repo, ref, s.worktree.output);
+            s.worktree.revisionRef = ref; this.save(r);
+          }
+          this.open();
+          await remove(isolation, s.worktree); s.worktree.removed = true;
+          (r.retiredTrees ??= []).push(s.worktree); this.save(r);
+        }
+        this.open();
+        if (r.state !== "paused") throw new Error("Workflow state changed during retry; inspect before retrying");
+        s.worktree = undefined; s.taskId = undefined; s.freshTask = true; s.attemptId = randomUUID();
+        this.retireIntegration(r);
+        s.task = `${s.task}\n\nRetry instruction:\n${message}`; s.access = selected;
+        s.state = "pending"; s.error = undefined; r.validated = false;
+        this.save(r);
+      }).finally(() => { this.preparing.delete(r.id); this.workspaceRuns.delete(run); });
+      this.workspaceRuns.add(run);
+      await run; return;
+    }
     this.tasks.store.validateForContinue(task);
     s.access = selected; s.state = "running"; s.error = undefined;
     if (s.worktree) s.worktree.output = undefined;
-    r.validated = false; r.integration = undefined; this.save(r);
+    r.validated = false; this.retireIntegration(r); this.save(r);
     try { await this.tasks.continue(task.id, message, selected, r.id); }
     catch (e) { s.state = "failed"; s.error = String(e); throw e; }
     finally { this.save(r); this.schedule(); }
+  }
+  private retireIntegration(r: WorkflowRecord): void {
+    if (r.integration) (r.retiredTrees ??= []).push(r.integration);
+    r.integration = undefined;
   }
   async cancel(id: string): Promise<void> {
     this.open(); const r = this.get(id);
@@ -280,19 +325,74 @@ export class WorkflowManager {
       else if (t && !t.stopped) throw new Error(`Unconfirmed shutdown: ${t.id}`);
     }));
     await this.integrationRuns.get(r.id);
-    this.reconcile(r); this.save(r); this.notify?.(r);
+    this.reconcile(r); this.save(r); this.emit(r);
     const failure = failures.find(f => f.status === "rejected");
     if (failure?.status === "rejected") throw new Error(`Workflow cancelled but cleanup unconfirmed: ${failure.reason}`);
     if (this.unsafe(r)) throw new Error("Workflow cancelled but process cleanup unconfirmed; inspect retained processes");
+    // Preparation can still be finishing after cancel marks the record terminal.
+    await this.pump;
+    await this.cleanup(id);
+  }
+  /** Retry terminal cleanup after a crash, ref failure or unconfirmed shutdown. */
+  async cleanup(id: string): Promise<void> {
+    this.open();
+    const r = this.get(id);
+    try { await this.cleanupRecord(r); }
+    catch (e) { r.cleanupError = String(e); this.save(r); throw e; }
+  }
+  private cleanupRecord(r: WorkflowRecord): Promise<void> {
+    const existing = this.cleaning.get(r.id);
+    if (existing) return existing;
+    const run = this.performCleanup(r).finally(() => this.cleaning.delete(r.id));
+    this.cleaning.set(r.id, run); return run;
+  }
+  private async performCleanup(r: WorkflowRecord): Promise<void> {
+    if (r.state !== "completed" && r.state !== "cancelled") throw new Error("Only completed/cancelled workflows can be cleaned up; paused scenes are retained");
+    if (r.workspace !== "isolated" || !r.isolation) return;
+    if (this.closed || this.preparing.has(r.id) || this.integrationRuns.has(r.id) || this.validation.has(r.id)) throw new Error("Wait for workspace preparation/validation before cleanup");
+    if (this.unsafe(r) || (r.validationPid && groupAlive(r.validationPid)) || [...this.tasks.records.values()].some(t => t.workflow?.id === r.id && (this.tasks.isLive(t.id) || !t.stopped))) throw new Error("Unconfirmed child/validation shutdown; worktrees retained");
+    // Derive completion from persisted removal/ref state so recovery and unrelated
+    // task updates do not rewrite refs or repeat terminal notifications.
+    const ownedTrees = [...r.steps.flatMap(s => s.worktree ? [s.worktree] : []),
+      ...(r.integration ? [r.integration] : []), ...(r.retiredTrees ?? [])];
+    if (r.baseRef && !r.cleanupError && ownedTrees.every(tree => tree.removed && (!tree.output || tree.revisionRef))) return;
+    // Capture stopped successful siblings even when cancellation won the race.
+    await this.collectForCleanup(r);
+    const isolation = r.isolation;
+    const prefix = `refs/pi-workflows/${r.id}`;
+    await retain(isolation.repo, `${prefix}/base`, isolation.base);
+    r.baseRef = `${prefix}/base`; this.save(r);
+    const trees = r.steps.flatMap(s => s.worktree ? [{ tree: s.worktree, ref: `${prefix}/steps/${s.id}` }] : []);
+    if (r.integration) trees.push({ tree: r.integration, ref: `${prefix}/result` });
+    // Retired published results must not overwrite the new /result ref. Pin
+    // their old commits first, before reusing any public step/result ref.
+    trees.unshift(...(r.retiredTrees ?? []).map((tree, i) => ({ tree,
+      ref: tree.revisionRef?.startsWith(`${prefix}/retired/`) ? tree.revisionRef : `${prefix}/retired/${i}` })));
+    // All preservation must succeed before the first destructive removal.
+    for (const { tree, ref } of trees) if (tree.output) {
+      await retain(isolation.repo, ref, tree.output); tree.revisionRef = ref; this.save(r);
+    }
+    for (const { tree } of trees) if (!tree.removed) {
+      if (this.closed) throw new Error("Owner shutting down; remaining worktrees retained");
+      await remove(isolation, tree); tree.removed = true; this.save(r);
+    }
+    r.cleanupError = undefined; this.save(r); this.emit(r);
+  }
+  private async collectForCleanup(r: WorkflowRecord): Promise<void> {
+    for (const s of r.steps) {
+      const t = this.findTask(r, s);
+      if (s.state !== "failed" && s.state !== "cancelled" && t?.stopped && t.state === "completed" && s.worktree && !s.worktree.output && !s.worktree.removed) {
+        await capture(s.worktree); s.state = "completed"; this.save(r);
+      }
+    }
   }
   async shutdown(): Promise<void> {
     this.closed = true; this.unsubscribe();
     for (const controller of this.validation.values()) controller.abort();
-    await this.pump;
-    await Promise.all(this.integrationRuns.values());
+    await Promise.allSettled([...(this.pump ? [this.pump] : []), ...this.integrationRuns.values(), ...this.cleaning.values(), ...this.workspaceRuns]);
     for (const r of this.records.values()) if (r.state === "running") { r.state = "paused"; r.error = "Parent session closed; explicit resume required"; this.save(r); }
   }
 }
 export function workflowSummary(r: WorkflowRecord): string {
-  return `${r.name} [${r.id}] ${r.state} workspace=${r.workspace ?? "shared"}\n${r.integration ? `Integration: ${r.integration.path} revision=${r.integration.output ?? "pending"} validated=${!!r.validated}${r.validationPid ? ` validationPid=${r.validationPid}` : ""}\n` : ""}${r.error ?? ""}\n${r.steps.map(s => `${s.id}: ${s.state} (${s.access}) dependsOn=[${s.dependsOn.join(", ")}]${s.taskId ? ` task=${s.taskId}` : ""}${s.error ? ` — ${s.error}` : ""}`).join("\n")}`;
+  return `${r.name} [${r.id}] ${r.state} workspace=${r.workspace ?? "shared"}\n${r.integration ? `Integration: ${r.integration.path} revision=${r.integration.revisionRef ?? r.integration.output ?? "pending"} removed=${!!r.integration.removed} validated=${!!r.validated}${r.validationPid ? ` validationPid=${r.validationPid}` : ""}\n` : ""}${r.error ?? ""}${r.cleanupError ? `\nCleanup blocked: ${r.cleanupError}` : ""}\n${r.steps.map(s => `${s.id}: ${s.state} (${s.access}) dependsOn=[${s.dependsOn.join(", ")}]${s.taskId ? ` task=${s.taskId}` : ""}${s.worktree ? ` worktree=${s.worktree.path} removed=${!!s.worktree.removed}${s.worktree.revisionRef ? ` ref=${s.worktree.revisionRef}` : ""}` : ""}${s.error ? ` — ${s.error}` : ""}`).join("\n")}`;
 }

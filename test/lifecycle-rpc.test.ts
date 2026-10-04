@@ -23,8 +23,8 @@ function setup(timeoutMs = 15000) {
   const results: string[] = [], events: any[] = [];
   let rpc: RpcProcess;
   const tools = [
-    { ...finalTool, sourceInfo: { path: provider, source: "extension", scope: "temporary" as const, origin: "top-level" as const } },
-    { ...createBashToolDefinition(dir), sourceInfo: { path: "<builtin:bash>", source: "builtin", scope: "temporary" as const, origin: "top-level" as const } },
+    { ...finalTool, exposure: "direct" as const, sourceInfo: { path: provider, source: "extension", scope: "temporary" as const, origin: "top-level" as const } },
+    { ...createBashToolDefinition(dir), exposure: "direct" as const, sourceInfo: { path: "<builtin:bash>", source: "builtin", scope: "temporary" as const, origin: "top-level" as const } },
   ];
   const loadout = resolveLoadout({ getActiveTools: () => tools.map(t => t.name), getAllTools: () => tools }, [], dir, "lifecycle-fixture/test", "off", dir);
   const manager = new TaskManager(new TaskStore(dir), {

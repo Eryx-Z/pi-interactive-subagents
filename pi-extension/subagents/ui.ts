@@ -1,8 +1,9 @@
+import { readFileSync, statSync } from "node:fs";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Text, stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
 import type { TaskManager } from "./tasks.ts";
 import type { TaskRecord } from "./store.ts";
-import { taskDashboard, type TaskAction } from "./dashboard.ts";
+import { taskDashboard, type DashboardPane, type TaskAction } from "./dashboard.ts";
 
 export function clean(text: string): string {
   return stripTerminalSequences(text).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
@@ -102,12 +103,13 @@ export function detail(r: TaskRecord, live = false): string {
   return clean([
     taskSummary(r),
     "\n── Run & access ──",
+    `Model: ${r.loadout.model ?? "unknown"} · Thinking: ${r.loadout.thinking ?? "unknown"}`,
     `Context: ${r.context} · Run: ${r.run}`,
     `Access: ${r.access ?? "legacy — choose access before continuation"}`,
     `Shutdown: ${r.state === "running" || r.state === "waiting" ? "not requested (active run)" : r.stopped ? "confirmed" : "unconfirmed"}`,
     ...(r.workflow ? [`Workflow: ${r.workflow.id}, step ${r.workflow.stepId}`] : []),
     `Cwd: ${r.loadout.cwd}`, `Session: ${r.sessionFile}`,
-    "\n── Task ──", r.task,
+    "\n── Task · Parent prompt ──", r.task,
     ...(r.error ? ["\n── Error ──", r.error] : []),
     "\n── Questions ──",
     r.questions.map(q => `${q.responseSent ? "✓" : "?"} ${q.id}: ${q.title}${q.responseSent ? " (answer sent)" : " (awaiting answer)"}`).join("\n") || "None",
@@ -116,10 +118,78 @@ export function detail(r: TaskRecord, live = false): string {
     live ? "\nLive details · bounded output/activity · End follows latest" : "\nSnapshot only · reopen to refresh · edits are not saved",
   ].join("\n"));
 }
+export function dashboardSummary(r: TaskRecord): string {
+  return inline(`${glyph(r.state)} ${r.name} · ${r.state}`);
+}
+function readTrace(record: TaskRecord): string {
+  const heading = [
+    "Recorded session JSONL · full records as pretty JSON",
+    "May include inherited context; only recorded/emitted thinking, not hidden reasoning.",
+    `Session: ${record.sessionFile}`, "",
+  ].join("\n");
+  try {
+    const raw = readFileSync(record.sessionFile, "utf8");
+    const entries = raw.split("\n").flatMap((line, index) => {
+      if (!line.trim()) return [];
+      try {
+        // Clean decoded strings before JSON serialization, which would otherwise escape controls.
+        const entry = JSON.parse(line, (_key, value: unknown) => typeof value === "string" ? clean(value) : value);
+        return [`── Record ${index + 1} ──\n${JSON.stringify(entry, null, 2)}`];
+      } catch {
+        // A live writer may not have finished the last line. Preserve it, not just a parse error.
+        return [`── Invalid or incomplete JSONL line ${index + 1} · raw ──\n${line}`];
+      }
+    });
+    return clean(heading + "\n" + (entries.join("\n\n") || "No session records yet"));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return clean(heading + "\n" + (code === "ENOENT" ? "No session transcript yet" : `Cannot read session transcript: ${String(error)}`));
+  }
+}
+
+// One last-file cache per dashboard interaction, retained across native action dialogs.
+// No other task's transcript is loaded, and switching files cannot grow the cache.
+export function createDashboardContent() {
+  let cached: { path: string; stamp: string; text: string } | undefined;
+  const trace = (record: TaskRecord): string => {
+    try {
+      const stat = statSync(record.sessionFile);
+      const stamp = `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}:${stat.ino}`;
+      if (cached?.path === record.sessionFile && cached.stamp === stamp) return cached.text;
+      const text = readTrace(record);
+      cached = { path: record.sessionFile, stamp, text };
+      return text;
+    } catch {
+      cached = undefined;
+      return readTrace(record);
+    }
+  };
+  return { summary: dashboardSummary, detail: (record: TaskRecord, pane: DashboardPane) => dashboardDetail(record, pane, trace) };
+}
+
+export function dashboardDetail(r: TaskRecord, pane: DashboardPane, trace = readTrace): string {
+  if (pane === "trace") return trace(r);
+  if (pane === "prompt") return clean(r.task || "No parent task prompt recorded");
+  if (pane === "activity") return clean([
+    "Latest assistant text", r.output || "No assistant text yet",
+    "\nRecent activity", r.log.join("\n") || "No activity yet",
+  ].join("\n"));
+  const shutdown = r.state === "running" || r.state === "waiting" ? "active" : r.stopped ? "confirmed" : "UNCONFIRMED — inspect before continuing";
+  return clean([
+    `Access: ${r.access ?? "legacy — choose before continuing"} · Context: ${r.context}`,
+    `Thinking: ${r.loadout.thinking ?? "unknown"} · Run: ${r.run} · Elapsed: ${elapsed(r, Date.now())}`,
+    `Shutdown: ${shutdown}`,
+    ...(r.workflow ? [`Workflow step: ${r.workflow.stepId}`] : []),
+    `\nNow: ${inline(r.activity)}`,
+    ...(r.error ? ["\nError", r.error] : []),
+    "\nQuestions",
+    r.questions.map(q => `${q.responseSent ? "Answered" : "Awaiting answer"}: ${q.title}`).join("\n") || "None",
+  ].join("\n"));
+}
 export async function taskMenu(manager: TaskManager, ctx: ExtensionContext, taskId?: string): Promise<void> {
   if (!ctx.hasUI) throw new Error("Use subagent_control in headless mode");
   if (ctx.mode === "tui" && !taskId) {
-    await taskDashboard(manager, ctx, { summary: taskSummary, detail: r => detail(r, true) },
+    await taskDashboard(manager, ctx, createDashboardContent(),
       (id, action) => taskAction(manager, ctx, id, action));
     return;
   }
