@@ -10,6 +10,7 @@ import { TaskManager } from "./tasks.ts";
 import { WorkflowManager, workflowSummary } from "./workflows.ts";
 import { detail, resultRenderer, taskMenu, taskSummary, widget, TaskWidget } from "./ui.ts";
 import type { AgentMessage } from "./context.ts";
+import { closeDashboards } from "./dashboard.ts";
 
 const result = (text: string) => ({ content: [{ type: "text" as const, text: bounded(text, 16000) }], details: {} });
 const accessSchema = () => StringEnum(["read-only", "full"] as const);
@@ -54,6 +55,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     snapshots.delete(id); return value;
   }
   pi.on("session_start", (_event, ctx) => {
+    closeDashboards();
     if (interval) clearInterval(interval);
     interval = undefined;
     ctx.ui.setWidget("rpc-subagents", undefined);
@@ -83,6 +85,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     widget(manager, ctx, display);
   });
   pi.on("session_shutdown", async () => {
+    closeDashboards();
     if (interval) clearInterval(interval);
     interval = undefined; snapshots.clear(); promptOptions = undefined;
     ctxForWidget?.ui.setWidget("rpc-subagents", undefined);
